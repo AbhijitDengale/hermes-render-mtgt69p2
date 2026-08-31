@@ -28,6 +28,23 @@ RUN chown -R hermes:hermes /opt/hermes/ui-tui /opt/hermes/node_modules \
           /opt/hermes/ui-tui/dist/entry.js \
  && chown -R hermes:hermes /opt/hermes/ui-tui
 
+# Memory-provider client libraries.
+#
+# Hermes ships the provider *plugins* (plugins/memory/honcho, supermemory, …)
+# but not their client SDKs, so `hermes memory status` reports the provider as
+# unavailable until the package is present. This MUST be baked into the image:
+# /opt/hermes/.venv lives in the image layer, so a runtime `uv pip install` is
+# silently discarded on the next deploy and memory falls back without erroring.
+#
+# The venv is uv-managed and has no pip, so install via uv (already on PATH
+# in the upstream image). The import check fails the build early rather than
+# shipping an image where memory quietly does not work.
+#
+# Add providers here as needed, e.g. "honcho-ai supermemory".
+ARG MEMORY_PACKAGES="honcho-ai"
+RUN VIRTUAL_ENV=/opt/hermes/.venv uv pip install --no-cache ${MEMORY_PACKAGES} \
+ && /opt/hermes/.venv/bin/python3 -c "import honcho; print('memory client OK: honcho-ai')"
+
 # Pull the official Render skill bundle from github.com/render-oss/skills
 # at a pinned commit. Mounted via skills.external_dirs at boot, so the
 # upstream Hermes skills-sync flow never touches these files. To upgrade,
