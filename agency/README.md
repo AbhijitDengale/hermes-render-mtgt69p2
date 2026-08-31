@@ -12,6 +12,38 @@ running system reads its live copies from the persistent disk at `/opt/data`.
 | `seed_state_transitions.sql` | The 85 legal lead-state transitions. |
 | `souls/ALL_SOULS.md` | Role definitions for ARIA, SENTINEL, ECHO, LEO, ORBIT. |
 | `souls/nova.md` | Role definition for NOVA (research). |
+| `research_mcp.py` | NOVA's research tools, served over MCP stdio. |
+
+## research_mcp.py
+
+A stdio MCP server giving NOVA two tools: `fetch_page` and `browser_health`.
+Deployed to `/opt/data/agency/research_mcp.py` and wired into **NOVA's profile
+only** — no other agent can reach it.
+
+`BrowserProvider` is the interface; `SteelBrowserProvider` is the current
+implementation, talking to Steel's REST `/v1/scrape`. No local browser, no CDP,
+no Playwright dependency. Swapping providers means one subclass and one env var.
+
+Safety properties, all exercised by `--selftest`:
+
+- **SSRF**: http/https only. DNS is resolved and *every* returned address is
+  checked, so a hostname pointing at `169.254.169.254`, loopback, RFC1918, or
+  link-local space is refused even when the name looks innocuous.
+- **Throttling**: one request per domain per interval, plus a concurrency cap.
+- **Caching**: keyed on URL with a content hash, so an unchanged page is not
+  re-fetched.
+- **Auditing**: every attempt lands in `research_fetches` — including blocked
+  and failed ones. This table is the source of truth for whether a page was
+  actually retrieved; do not trust an agent's claim that it read something.
+- **Retries**: transient and 429 responses retry; 4xx does not.
+
+Run `python3 research_mcp.py --selftest` to check provider health and print the
+URL-validation decisions.
+
+Config comes from the environment only — `BROWSER_PROVIDER`, `STEEL_API_KEY`,
+`STEEL_BASE_URL`, `BROWSER_MAX_CONCURRENCY`, `BROWSER_TIMEOUT_SECONDS`,
+`BROWSER_CACHE_TTL_HOURS`. The profile's `mcp_servers` block passes these
+through by `${VAR}` reference, so the secret stays in `.env`.
 
 ## Agents
 
