@@ -30,7 +30,8 @@ from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import pipeline as P  # noqa: E402
+import followups as F  # noqa: E402
+import pipeline as P   # noqa: E402
 
 HERMES = os.getenv("HERMES_BIN", "/opt/hermes/.venv/bin/hermes")
 MAILHUB_BASE = os.getenv("MAILHUB_BASE_URL", "").rstrip("/")
@@ -160,7 +161,8 @@ def to_copy(con, lead) -> str:
 
 
 def dispatch_copy(con, lead) -> Optional[str]:
-    draft = P.load_draft(con, lead["id"], 0)
+    stage = lead["followup_stage"] or 0
+    draft = P.load_draft(con, lead["id"], stage)
     if draft and draft["status"] == "draft" and not draft["qa_status"]:
         with P.writing(con):
             P.transition(con, lead["id"], "COPY_READY", AGENT,
@@ -175,7 +177,7 @@ def dispatch_copy(con, lead) -> Optional[str]:
         (lead["id"],)).fetchone()["c"]
     issues = ""
     if attempt:
-        prev = P.load_draft(con, lead["id"], 0)
+        prev = P.load_draft(con, lead["id"], stage)
         if prev and prev["qa_issues"]:
             issues = ("\n\nSENTINEL rejected the previous draft for these "
                       "reasons — fix them:\n" + prev["qa_issues"])
@@ -198,7 +200,7 @@ def to_qa(con, lead) -> str:
 
 
 def dispatch_qa(con, lead) -> Optional[str]:
-    draft = P.load_draft(con, lead["id"], 0)
+    draft = P.load_draft(con, lead["id"], lead["followup_stage"] or 0)
     if draft and draft["qa_status"] == "approved":
         with P.writing(con):
             P.transition(con, lead["id"], "READY_TO_SEND", AGENT,
@@ -243,7 +245,8 @@ def queue_and_send(con, lead) -> Optional[str]:
     SENT is set only on a provider-confirmed send. Marking it on `queued` would
     make the state machine claim something happened that had not.
     """
-    draft = P.load_draft(con, lead["id"], 0)
+    stage = lead["followup_stage"] or 0
+    draft = P.load_draft(con, lead["id"], stage)
     if not draft or draft["qa_status"] != "approved":
         with P.writing(con):
             P.transition(con, lead["id"], "HUMAN_REVIEW", AGENT,
@@ -253,8 +256,8 @@ def queue_and_send(con, lead) -> Optional[str]:
 
     # Derived from the approved content, so a retry presents the same key and
     # a changed message cannot reuse the old one.
-    key = "lead:%s:%s:stage0:%s" % (lead["id"], lead["campaign_id"],
-                                    draft["content_hash"][:16])
+    key = "lead:%s:%s:stage%d:%s" % (lead["id"], lead["campaign_id"],
+                                     stage, draft["content_hash"][:16])
 
     if not draft["mailhub_queue_id"]:
         res = mailhub("POST", "/api/v1/messages", {
@@ -262,7 +265,7 @@ def queue_and_send(con, lead) -> Optional[str]:
             "subject": draft["subject"], "body_text": draft["body"],
             "idempotency_key": key,
             "meta": {"lead_id": lead["id"], "campaign_id": lead["campaign_id"],
-                     "stage": 0},
+                     "stage": stage},
         })
         if res.get("status") not in ("queued", "duplicate"):
             with P.writing(con):
@@ -311,6 +314,59 @@ def queue_and_send(con, lead) -> Optional[str]:
     return None                          # still pending or claimed
 
 
+
+def after_sent(con, lead) -> Optional[str]:
+    """Schedule the next follow-up, or leave the lead alone.
+
+    Runs once per send: if a schedule row for the next stage already exists,
+    there is nothing to do, so a repeated tick cannot stack follow-ups.
+    """
+    stage = (lead["followup_stage"] or 0) + 1
+    existing = con.execute(
+        "SELECT 1 FROM followups WHERE lead_id=? AND stage=?",
+        (lead["id"], stage)).fetchone()
+    if existing:
+        return None
+    due_at = F.next_due(con, lead["campaign_id"], stage)
+    if not due_at:
+        return None                      # campaign schedule exhausted
+    with P.writing(con):
+        F.schedule(con, lead["id"], lead["campaign_id"], stage, due_at)
+        P.transition(con, lead["id"], "FOLLOWUP_WAITING", AGENT,
+                     "follow-up %d scheduled for %s" % (stage, due_at),
+                     expect="SENT")
+    return "SENT -> FOLLOWUP_WAITING (stage %d due %s)" % (stage, due_at)
+
+
+def followup_copy(con, lead) -> Optional[str]:
+    """A follow-up is due. It goes through ARIA and SENTINEL like any message —
+    reusing a pre-written draft without a fresh approval would mean sending
+    text nothing had reviewed."""
+    stage = lead["followup_stage"] or 1
+    draft = P.load_draft(con, lead["id"], stage)
+    if draft and draft["status"] == "draft" and not draft["qa_status"]:
+        with P.writing(con):
+            P.transition(con, lead["id"], "QA_PENDING", AGENT,
+                         "follow-up %d drafted" % stage,
+                         expect="FOLLOWUP_PENDING")
+        return "FOLLOWUP_PENDING -> QA_PENDING (stage %d)" % stage
+
+    prior = P.load_draft(con, lead["id"], 0)
+    context = ""
+    if prior:
+        context = ("\n\nThe first email said:\n" + (prior["body"] or "")[:600])
+    dispatch(lead["id"], "aria", "Follow-up %d for %s" % (stage, lead["id"]),
+             brief({"lead_id": lead["id"]},
+                   "You are ARIA. Call get_assignment, then write FOLLOW-UP "
+                   "number %d and save it with save_draft using stage %d. "
+                   "It must be shorter than the first email, add something "
+                   "new rather than repeating it, and cite only sources "
+                   "already present in NOVA's research." % (stage, stage)
+                   + context),
+             "followup:%d" % stage)
+    return None
+
+
 HANDLERS = [
     ("NEW", admit),
     ("RESEARCH_PENDING", dispatch_research),
@@ -321,6 +377,8 @@ HANDLERS = [
     ("QA_PENDING", dispatch_qa),
     ("QA_REJECTED", rewrite),
     ("READY_TO_SEND", queue_and_send),
+    ("SENT", after_sent),
+    ("FOLLOWUP_PENDING", followup_copy),
 ]
 
 

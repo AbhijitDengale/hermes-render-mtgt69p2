@@ -31,7 +31,8 @@ from typing import Any, Dict, List
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import pipeline as P  # noqa: E402
+import followups as F  # noqa: E402
+import pipeline as P   # noqa: E402
 
 ROLE = os.getenv("AGENCY_ROLE", "").strip().lower()
 MAILHUB_BASE = os.getenv("MAILHUB_BASE_URL", "").rstrip("/")
@@ -225,7 +226,176 @@ def t_submit_verdict(a: Dict[str, Any]) -> Dict[str, Any]:
             "approval_id": res.get("id"), "content_hash": res.get("content_hash")}
 
 
+# --- LEO --------------------------------------------------------------------
+# LEO picks a label; the label-to-state mapping is code. A model cannot invent
+# a transition, and anything commercial routes to a human by construction
+# rather than by the model choosing to be careful.
+
+CLASSIFICATIONS = (
+    "positive", "interested", "question", "pricing_question", "objection",
+    "not_now", "negative", "unsubscribe", "wrong_person", "referral",
+    "out_of_office", "meeting_request", "proposal_request",
+    "contract_request", "unclear",
+)
+
+CLASS_TO_STATE = {
+    "unsubscribe": "UNSUBSCRIBED",
+    "negative": "NEGATIVE",
+    "positive": "POSITIVE",
+    "interested": "POSITIVE",
+    "meeting_request": "MEETING_STAGE",
+    "pricing_question": "HUMAN_REVIEW",
+    "proposal_request": "HUMAN_REVIEW",
+    "contract_request": "HUMAN_REVIEW",
+    "objection": "HUMAN_REVIEW",
+    "wrong_person": "HUMAN_REVIEW",
+    "referral": "HUMAN_REVIEW",
+    "unclear": "HUMAN_REVIEW",
+    "question": "HUMAN_REVIEW",
+    "not_now": "HUMAN_REVIEW",
+    # out_of_office is handled separately — an autoresponder is not an answer.
+}
+
+# Never left to the model's discretion, whatever it reports.
+ALWAYS_HUMAN = frozenset({"pricing_question", "proposal_request",
+                          "contract_request", "objection", "referral",
+                          "wrong_person", "unclear"})
+
+
+def t_get_reply(a: Dict[str, Any]) -> Dict[str, Any]:
+    """The reply to classify, plus the lead it belongs to."""
+    with P.connect() as con:
+        r = con.execute("SELECT * FROM inbound_replies WHERE id=?",
+                        (a["reply_id"],)).fetchone()
+        if not r:
+            return {"error": "no such reply"}
+        lead = P.get_lead(con, r["lead_id"]) if r["lead_id"] else None
+        return {
+            "reply_id": r["id"], "lead_id": r["lead_id"],
+            "campaign_id": r["campaign_id"], "from": r["from_email"],
+            "subject": r["subject"], "body_text": r["body_text"],
+            "received_at": r["received_at"], "is_bounce": bool(r["is_bounce"]),
+            "is_auto_reply": bool(r["is_auto_reply"]),
+            "business_name": lead["business_name"] if lead else None,
+            "lead_state": lead["state"] if lead else None,
+            "followups_already_cancelled": bool(r["followups_cancelled"]),
+        }
+
+
+def t_submit_classification(a: Dict[str, Any]) -> Dict[str, Any]:
+    """Record what the reply means and move the lead to the mapped state."""
+    reply_id = a["reply_id"]
+    cls = (a.get("classification") or "").lower().strip()
+    if cls not in CLASSIFICATIONS:
+        return {"error": "classification must be one of %s" % (CLASSIFICATIONS,)}
+    requires_human = bool(a.get("requires_human_review")) or cls in ALWAYS_HUMAN
+
+    with P.connect() as con:
+        r = con.execute("SELECT * FROM inbound_replies WHERE id=?",
+                        (reply_id,)).fetchone()
+        if not r:
+            return {"error": "no such reply"}
+        if r["classified_at"]:
+            # Exactly once: a redispatched task must not re-run the effects.
+            return {"already_classified": r["classification"],
+                    "reply_id": reply_id}
+        lead_id = r["lead_id"]
+
+        with P.writing(con):
+            con.execute(
+                "UPDATE inbound_replies SET classification=?, confidence=?,"
+                "       summary=?, recommended_action=?, draft_reply=?,"
+                "       requires_human=?, classified_at=datetime('now') "
+                " WHERE id=?",
+                (cls, float(a.get("confidence") or 0),
+                 (a.get("summary") or "")[:1000],
+                 (a.get("recommended_action") or "")[:500],
+                 (a.get("draft_reply") or "")[:4000],
+                 1 if requires_human else 0, reply_id))
+
+        if not lead_id:
+            return {"recorded": cls, "lead": None}
+
+        if cls == "out_of_office":
+            # Reschedule only on an unambiguous date. Guessing means emailing
+            # someone while they are still away, so anything less becomes a
+            # human decision.
+            until = F.parse_return_date(r["body_text"] or "")
+            if until:
+                with P.writing(con):
+                    F.hold_for_ooo(con, lead_id, until, 1, r["campaign_id"])
+                return {"recorded": cls, "rescheduled_until": until,
+                        "lead_state": "unchanged"}
+            with P.writing(con):
+                try:
+                    P.transition(con, lead_id, "HUMAN_REVIEW", "leo",
+                                 "out of office, no parseable return date")
+                except P.TransitionError:
+                    pass
+            return {"recorded": cls, "rescheduled_until": None, "escalated": True}
+
+        target = "HUMAN_REVIEW" if requires_human else CLASS_TO_STATE.get(cls)
+        moved = None
+        if target:
+            with P.writing(con):
+                try:
+                    P.transition(con, lead_id, target, "leo",
+                                 "%s (confidence %.2f)"
+                                 % (cls, float(a.get("confidence") or 0)))
+                    moved = target
+                except P.TransitionError as exc:
+                    moved = "refused: %s" % exc
+
+        suppressed = None
+        if cls == "unsubscribe" and r["from_email"]:
+            # An opt-out has to reach MailHub's suppression list, not just our
+            # own state. LEO holds a suppress-scoped credential and no other.
+            suppressed = _mailhub("/api/v1/suppression",
+                                  {"email": r["from_email"],
+                                   "reason": "unsubscribed",
+                                   "detail": "LEO reply %d" % reply_id})
+
+        if requires_human:
+            with P.writing(con):
+                con.execute(
+                    "INSERT OR IGNORE INTO human_escalations "
+                    " (id, lead_id, campaign_id, raised_by, reason,"
+                    "  reply_summary, recommended_action, draft_response) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    ("H-%d" % reply_id, lead_id, r["campaign_id"], "leo", cls,
+                     (a.get("summary") or "")[:1000],
+                     (a.get("recommended_action") or "")[:500],
+                     (a.get("draft_reply") or "")[:4000]))
+
+    return {"recorded": cls, "lead_state": moved,
+            "requires_human_review": requires_human,
+            "suppression": suppressed}
+
+
 TOOLS: Dict[str, Dict[str, Any]] = {
+    "get_reply": {
+        "roles": ("leo",),
+        "fn": t_get_reply,
+        "description": "Read the prospect reply you have been asked to classify.",
+        "schema": {"type": "object", "properties": {
+            "reply_id": {"type": "integer"}}, "required": ["reply_id"]},
+    },
+    "submit_classification": {
+        "roles": ("leo",),
+        "fn": t_submit_classification,
+        "description": ("Record what the reply means. You do not negotiate: "
+                        "price, discounts, legal or payment terms, guarantees "
+                        "and contracts always go to a human."),
+        "schema": {"type": "object", "properties": {
+            "reply_id": {"type": "integer"},
+            "classification": {"type": "string"},
+            "confidence": {"type": "number"},
+            "summary": {"type": "string"},
+            "recommended_action": {"type": "string"},
+            "draft_reply": {"type": "string"},
+            "requires_human_review": {"type": "boolean"}},
+            "required": ["reply_id", "classification"]},
+    },
     "get_assignment": {
         "roles": ("nova", "aria", "sentinel"),
         "fn": t_get_assignment,
