@@ -233,8 +233,22 @@ def save_draft(con: sqlite3.Connection, lead_id: str, campaign_id: str,
     Writing a draft always clears any previous QA verdict: text that has
     changed has not been reviewed, and leaving a stale `approved` on it would
     be exactly the bypass the gate exists to prevent.
+
+    A message that has already been transmitted is NOT a draft and cannot be
+    overwritten. It is the record of what a real person received, and the
+    provider ids on it would otherwise end up attached to text that was never
+    sent. Live testing caught exactly that: a follow-up written against the
+    wrong stage silently replaced the original outreach.
     """
     mid = message_id(lead_id, stage)
+    existing = con.execute(
+        "SELECT status, provider_message_id FROM messages WHERE id=?",
+        (mid,)).fetchone()
+    if existing and (existing["status"] in ("sent", "simulated", "queued")
+                     or existing["provider_message_id"]):
+        raise TransitionError(
+            "message %s is already %s and cannot be rewritten — a follow-up "
+            "belongs to a new stage" % (mid, existing["status"]))
     con.execute(
         "INSERT INTO messages (id, lead_id, campaign_id, direction, kind,"
         "                      followup_stage, subject, body, claims_used,"

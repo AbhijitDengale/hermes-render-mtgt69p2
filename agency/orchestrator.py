@@ -351,6 +351,27 @@ def followup_copy(con, lead) -> Optional[str]:
                          expect="FOLLOWUP_PENDING")
         return "FOLLOWUP_PENDING -> QA_PENDING (stage %d)" % stage
 
+    # A task can finish having produced nothing — a model that answered in prose
+    # instead of calling the tool, say. Re-dispatching under the same key just
+    # returns that dead task, so the lead would sit here forever. Count the
+    # attempts and vary the key, bounded so a persistently failing stage
+    # escalates instead of looping.
+    retries = con.execute(
+        "SELECT COUNT(*) c FROM events WHERE lead_id=? AND event_type='followup.retry'"
+        "   AND detail = ?", (lead["id"], "stage %d" % stage)).fetchone()["c"]
+    if retries >= 3:
+        with P.writing(con):
+            P.transition(con, lead["id"], "HUMAN_REVIEW", AGENT,
+                         "follow-up %d produced no draft after %d attempts"
+                         % (stage, retries), expect="FOLLOWUP_PENDING")
+        return "FOLLOWUP_PENDING -> HUMAN_REVIEW (no draft after %d tries)" % retries
+    with P.writing(con):
+        con.execute(
+            "INSERT INTO events (lead_id, campaign_id, agent, event_type, detail)"
+            " VALUES (?,?,?,?,?)",
+            (lead["id"], lead["campaign_id"], AGENT, "followup.retry",
+             "stage %d" % stage))
+
     prior = P.load_draft(con, lead["id"], 0)
     context = ""
     if prior:
@@ -361,9 +382,11 @@ def followup_copy(con, lead) -> Optional[str]:
                    "number %d and save it with save_draft using stage %d. "
                    "It must be shorter than the first email, add something "
                    "new rather than repeating it, and cite only sources "
-                   "already present in NOVA's research." % (stage, stage)
+                   "already present in NOVA's research. Pass stage=%d to "
+                   "save_draft — omitting it would overwrite the original "
+                   "email." % (stage, stage, stage)
                    + context),
-             "followup:%d" % stage)
+             "followup:%d:r%d" % (stage, retries))
     return None
 
 

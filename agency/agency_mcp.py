@@ -54,6 +54,14 @@ def _campaign(con, campaign_id: str) -> Dict[str, Any]:
     return dict(row) if row else {}
 
 
+def _stage(con, lead_id: str) -> int:
+    """Which message the lead is currently working on: 0 initially, then the
+    follow-up number. Read from the lead so SENTINEL reviews the same draft
+    ARIA just wrote."""
+    row = P.get_lead(con, lead_id)
+    return int((row["followup_stage"] if row else 0) or 0)
+
+
 def _assignment(lead_id: str) -> Dict[str, Any]:
     """Everything an agent legitimately needs, and nothing else.
 
@@ -87,7 +95,7 @@ def _assignment(lead_id: str) -> Dict[str, Any]:
         if ROLE in ("aria", "sentinel"):
             out["research"] = P.load_research(con, lead_id)
         if ROLE == "sentinel":
-            draft = P.load_draft(con, lead_id, 0)
+            draft = P.load_draft(con, lead_id, _stage(con, lead_id))
             if draft:
                 out["draft"] = {
                     "subject": draft["subject"], "body": draft["body"],
@@ -178,10 +186,17 @@ def t_save_draft(a: Dict[str, Any]) -> Dict[str, Any]:
             if c.get("source_url") not in sources:
                 return {"error": "claim cites %r, which is not in NOVA's "
                                  "verified research" % c.get("source_url")}
-        with P.writing(con):
-            mid = P.save_draft(con, lead_id, lead.get("campaign_id"), 0,
-                               subject, body, claims)
-    return {"saved": True, "message_id": mid,
+        # The stage decides WHICH message this is. Without it every follow-up
+        # would overwrite the original outreach -- which is precisely what
+        # happened before the parameter existed.
+        stage = int(a.get("stage") or 0)
+        try:
+            with P.writing(con):
+                mid = P.save_draft(con, lead_id, lead.get("campaign_id"), stage,
+                                   subject, body, claims)
+        except P.TransitionError as exc:
+            return {"error": str(exc)}
+    return {"saved": True, "message_id": mid, "stage": stage,
             "content_hash": P.content_hash(subject, body)}
 
 
@@ -199,13 +214,14 @@ def t_submit_verdict(a: Dict[str, Any]) -> Dict[str, Any]:
 
     with P.connect() as con:
         lead = _lead(con, lead_id)
-        draft = P.load_draft(con, lead_id, 0)
+        stage = _stage(con, lead_id)
+        draft = P.load_draft(con, lead_id, stage)
         if not draft:
             return {"error": "no draft to review for %s" % lead_id}
 
         if status != "approved":
             with P.writing(con):
-                P.record_qa(con, lead_id, 0, status, issues)
+                P.record_qa(con, lead_id, stage, status, issues)
             return {"recorded": status, "lead_id": lead_id, "issues": issues}
 
         # Approving must review the text that is actually stored. Accepting a
@@ -220,7 +236,7 @@ def t_submit_verdict(a: Dict[str, Any]) -> Dict[str, Any]:
         if res.get("error"):
             return {"error": "MailHub refused the approval", "detail": res}
         with P.writing(con):
-            P.record_qa(con, lead_id, 0, "approved", issues,
+            P.record_qa(con, lead_id, stage, "approved", issues,
                         approval_id=str(res.get("id")))
     return {"recorded": "approved", "lead_id": lead_id,
             "approval_id": res.get("id"), "content_hash": res.get("content_hash")}
@@ -426,6 +442,10 @@ TOOLS: Dict[str, Dict[str, Any]] = {
         "schema": {"type": "object", "properties": {
             "lead_id": {"type": "string"}, "subject": {"type": "string"},
             "body": {"type": "string"},
+            "stage": {"type": "integer",
+                      "description": "0 for the first email, 1+ for follow-ups. "
+                                     "Required for follow-ups: omitting it "
+                                     "would target the original message."},
             "claims_used": {"type": "array", "items": {"type": "object"}}},
             "required": ["lead_id", "subject", "body"]},
     },
