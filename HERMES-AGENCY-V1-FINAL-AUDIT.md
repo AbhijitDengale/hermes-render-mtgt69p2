@@ -8,35 +8,40 @@ No new features were added in this phase.
 
 ## Readiness classification
 
-> ### CONTROLLED TESTING
+> ### LOW-VOLUME PRODUCTION
 >
-> The security blocker is **resolved**: `e6d8e21` is deployed and the
-> suppression matrix passes 21/21 against the live API, with multi-tenant
-> isolation proved separately against the production database.
->
-> One **critical workflow gap** remains, and it is why this is not production.
+> **Not** bulk production. No critical workflow gap remains, but two
+> verifications are still open and neither can be closed from here.
 
-Every safety mechanism has been verified against the live system, and both edge
-cases this audit found are fixed and covered by tests (§23a).
+The security blocker is resolved — `e6d8e21` deployed, suppression matrix 21/21
+against the live API, multi-tenant isolation proved against the production
+database. Both edge cases this audit found are fixed (§23a).
 
-What stops it being production is not a missing feature — it is that **the
-pipeline does not advance on its own.** ECHO, review alerts and ORBIT are
-scheduled; the orchestrator is not. Nothing moves a lead from `READY_TO_SEND`
-to `SENT` after MailHub confirms, and nothing moves a due follow-up out of
-`FOLLOWUP_PENDING`. Both need somebody to run `orchestrator.py tick`. A system
-that requires a human to keep poking it is not running in production; it is
-being operated by hand.
+The gap that kept the previous revision at CONTROLLED TESTING — that the
+pipeline did not advance on its own — is **closed**. `maya-orchestrator` runs
+every two minutes on MAYA's profile with no LLM in it, and a lead ingested at
+12:07 reached SENTINEL-approved and queued at 12:17 with nobody touching it
+(§23b). Follow-ups, rejections, pauses and resumes all run unattended too.
 
-Also outstanding, but evidence rather than gaps:
+Two things remain unverified, both external to the code:
 
-- The final E2E is **queued, not yet delivered** — the mailbox is at 5/5 and
-  the cap was not raised (§23).
-- Twelve leads and three real messages say nothing about deliverability, reply
-  rate or spam placement.
-- One warmed mailbox. Rotation has never been exercised.
+1. **`READY_TO_SEND` → `SENT` has not been observed end to end**, because the
+   mailbox is at its warmup cap and the cap must not be raised. Two messages
+   sit queued and approved waiting for the UTC date rollover. The mechanism is
+   the same one that recorded two earlier real sends.
+2. **`maya-orchestrator` has not survived a restart**, because the Render SSH
+   session cannot signal the gateway — different PID namespace. The mechanism
+   is proven: `echo-followups` is stored identically and has run 122 times
+   across eight gateway restarts.
 
-**BULK PRODUCTION is not appropriate** while the orchestrator gap stands,
-regardless of how much volume is run.
+Neither is a defect, and neither would be discovered by more testing from here
+— they need the clock and a restart respectively.
+
+Still true, and the reason this is **low-volume**:
+
+- Thirteen leads and three real messages say nothing about deliverability,
+  reply rate or spam placement.
+- One warmed mailbox at five sends a day. Rotation has never been exercised.
 
 ---
 
@@ -298,12 +303,46 @@ Three, each deterministic (`--no-agent`), **no duplicates**.
 
 | Name | ID | Home | Schedule | Script | Delivery | Runs | Last | Failures |
 |---|---|---|---|---|---|---|---|---|
-| `echo-followups` | `49ce35ce006c` | `profiles/echo` | every 2m | `echo_followups.py` | local | 73+ | ok | streak 0 |
+| `maya-orchestrator` | `6416a10f0628` | root (MAYA) | every 2m | `maya_orchestrator.py` | local | 6+ | ok | streak 0 |
+| `echo-followups` | `49ce35ce006c` | `profiles/echo` | every 2m | `echo_followups.py` | local | 122+ | ok | streak 0 |
 | `review-alerts` | `87f459aea57b` | root (MAYA) | every 2m | `review_alerts.py` | `discord:…0898` (#alerts) | 18+ | ok | streak 0 |
 | `orbit-daily` | `eeb1258ca105` | root (MAYA) | `0 8 * * *` | `orbit_daily.py` | `discord:…5817` (#maya-office) | 1 | ok | streak 0 |
 
-No LLM decides whether a follow-up is due, whether an escalation needs a human,
-or what a metric is. All three are code.
+No LLM decides whether a follow-up is due, whether an escalation needs a
+human, what a metric is, or which stage a lead advances to. All four are code.
+
+### 12a. The orchestrator tick
+
+`maya-orchestrator` is what makes the pipeline run without a person. It reads
+lead states and runs the handler the state machine says applies. Which agent
+gets dispatched, whether a message may be queued, whether a follow-up is due —
+all of that is already decided by the tables and by SENTINEL's approval. A
+model deciding any of it here would be a second opinion competing with the gate.
+
+Terminal and human-owned states are respected by having **no handler at all**:
+`HUMAN_REVIEW`, `CLOSED`, `UNSUBSCRIBED`, `NEGATIVE`, `BOUNCED`, `POSITIVE`,
+`MEETING_STAGE`, `REPLIED` and `ERROR` are never touched. Paused campaigns are
+excluded in `pipeline.eligible()`, so every handler inherits the check rather
+than each one having to remember it.
+
+**Idempotence** comes from four mechanisms, none of them new:
+
+| Mechanism | Prevents |
+|---|---|
+| per-lead lease | two ticks working the same lead |
+| compare-and-swap transitions | a state moving from something unexpected |
+| Kanban key with lifecycle generation | a duplicate task for one stage |
+| content-derived MailHub idempotency key | the same message being sent twice |
+
+The wrapper adds a whole-tick lock on top — not for correctness, which the four
+already provide, but so a tick that overruns its slot does not get a second one
+walking the same states behind it. It reclaims itself if a tick dies holding it.
+
+Proven against the live database after the cron had been running: no duplicate
+message row, no MailHub queue id used twice, no provider id against two
+messages, no approval consumed twice, no lead entering the same state twice in
+a row, no duplicate follow-up stage, and no duplicate Kanban task across 39
+keyed tasks.
 
 Both Discord jobs run from the **root** profile deliberately: Discord is
 configured there and nowhere else. A job scheduled on a sub-profile executes
@@ -577,6 +616,103 @@ session rather than only the one asked for. Those follow-up drafts carry
 `qa_status = NULL`, so the gate still blocks them — `queue_and_send` routes any
 unapproved draft to `HUMAN_REVIEW` rather than sending it. Untidy, not unsafe.
 
+## 23b. Autonomy — the pipeline running unattended
+
+`maya-orchestrator` was installed at 12:05 UTC. Everything below happened with
+**no manual tick**.
+
+### TEST 2 — a new lead, start to queue, entirely on its own
+
+`L-fd990c7a825c53fc` (PostHog, `https://posthog.com`), ingested 12:07:38 into a
+campaign that did not previously exist.
+
+```
+12:07:38  ingest                               NEW               generation 1
+12:07:59  MAYA   NEW               -> RESEARCH_PENDING
+12:08:01  MAYA   RESEARCH_PENDING  -> RESEARCHING       Kanban t_3fbce64d -> NOVA
+12:11:00  NOVA   RESEARCHING       -> RESEARCH_COMPLETE 5 observations
+12:11:00  MAYA   RESEARCH_COMPLETE -> COPY_PENDING
+12:14:00  ARIA   COPY_PENDING      -> COPY_READY        draft M-…-0
+12:14:00  MAYA   COPY_READY        -> QA_PENDING
+12:17:01  SENTINEL QA_PENDING      -> READY_TO_SEND     approval 8
+          MAYA   READY_TO_SEND        queued as MailHub #21
+```
+
+Eight transitions across four cron runs in nine minutes. Subject line:
+*"Question about PostHog's context warehouse"* — written from the research, not
+from what the model already knew.
+
+The campaign was auto-created by the import and came out **active**, which is
+the `ensure_campaign` fix working: had it been created `draft`, this lead would
+have sat at `NEW` forever with nothing in the logs to say why.
+
+### TEST 3 — an autonomous follow-up, including a rejection
+
+`L-T3-FOLLOWUP`. Its first send was seeded, because a genuine one needs quota
+the mailbox does not have; everything after that is real.
+
+```
+12:10:00  ECHO   FOLLOWUP_WAITING -> FOLLOWUP_PENDING   follow-up 1 is due
+12:11:03  MAYA   dispatched ARIA for stage 1
+12:14:03  MAYA   FOLLOWUP_PENDING -> QA_PENDING         follow-up 1 drafted
+          SENTINEL rejected it
+12:2x     MAYA   QA_PENDING       -> COPY_PENDING       back to ARIA to rewrite
+```
+
+The rejection is the interesting part. SENTINEL turned down the follow-up and
+MAYA sent it back for a rewrite without anybody intervening — the QA gate
+holding under autonomy, not just under supervision.
+
+### TEST 4 — pause and resume
+
+`L-T4-PAUSE`, campaign paused before ECHO could act:
+
+| | while paused | after resume |
+|---|---|---|
+| lead state | `FOLLOWUP_WAITING` | advanced to `FOLLOWUP_PENDING` |
+| follow-up | `scheduled` | `dispatched` |
+| **attempts** | **0** | **1** (the real dispatch) |
+| block reason | *campaign C-T4-PAUSE is paused* | cleared |
+| `followup.blocked` events | **1**, not one per tick | — |
+| `MAYA eligible()` | **excluded** | included |
+
+ECHO ticked many times while it was paused and charged it nothing. One event,
+not dozens. On resume the pipeline picked it straight back up.
+
+### TEST 1 — `READY_TO_SEND` → `SENT`, still pending
+
+MailHub **#20** is queued with `approval_id 7`; Test 2's is **#21** with
+`approval_id 8`. Both wait on the same thing: the mailbox is at **5/5** and
+`sent_today` resets on the UTC date rollover. The cap was not raised.
+
+Once MailHub sends, `queue_and_send` polls `/api/v1/messages/{id}` on the next
+tick and records the provider id, thread id and `sent_at`. That path is not
+speculative — it is how the two earlier real sends were recorded
+(`1a05bfa243ee938a`, `1a05c213cc68445b`). What is new is only that nobody has
+to run the tick. **Unverified until the quota resets.**
+
+### TEST 5 — restart, partially proven
+
+**I could not restart the service.** The Render SSH session runs in a different
+PID namespace from the gateway: `kill -9` on the gateway pid returns exit 1 as
+root and the process is untouched, and `/proc/<pid>/ns/pid` is unreadable. This
+is the same thing that made the earlier MailHub filesystem check misleading.
+
+What *is* established:
+
+- Cron state lives in `/opt/data/cron/jobs.json` on the persistent 4.9 GB disk,
+  not in container memory.
+- The gateway has restarted **eight times** (per `gateway-starts.log`), and
+  `echo-followups` — created 08:17, stored in exactly the same way — has run
+  **122 times** across those restarts without being lost or duplicated.
+- The installer creates cron jobs **by name**, so a job that ever did vanish
+  would be restored on the next deploy rather than duplicated.
+
+What is **not** yet established: `maya-orchestrator` itself has not lived
+through a restart, having been created at 12:05. The mechanism is proven; this
+particular job's use of it is inferred. Restarting the Hermes service from the
+Render dashboard would close it in one step.
+
 ## 23a. The two edge cases, fixed
 
 Both were found by this audit and both are now closed, with migration 005 and
@@ -654,15 +790,13 @@ completed task can no longer answer for the new lifecycle.
    its own. If NOVA research fails in bursts, check this before the API key.
 8. **No automated deploy verification.** Nothing currently notices that a push
    did not become a deploy — which is exactly how limitation 1 went unnoticed.
-9. **Nothing advances `READY_TO_SEND` to `SENT` on its own.** The orchestrator
-   has no cron job, so after MailHub confirms a send somebody must run
-   `orchestrator.py tick` for the lead to pick up the provider id and move on.
-   ECHO, review alerts and ORBIT are scheduled; the pipeline itself is not.
-   Deliberately not changed here — installing a job that autonomously drives
-   the whole pipeline is not a change to make silently during a release
-   freeze, and it would advance the other in-flight leads too. **This is the
-   one gap that keeps the classification below LOW-VOLUME PRODUCTION on
-   workflow grounds rather than evidence grounds.**
+9. **Two open verifications, neither a defect:** the `READY_TO_SEND` → `SENT`
+   transition has not been watched end to end (waiting on the warmup cap), and
+   `maya-orchestrator` has not yet survived a restart (the SSH session cannot
+   signal the gateway). Both are described in §23b.
+
+   *Previously listed here: nothing advanced `READY_TO_SEND` to `SENT` on its
+   own. That is now fixed — see §12a and §23b.*
 10. **ARIA writes unrequested follow-up drafts.** In the final E2E she produced
     stages 1–3 alongside stage 0. They carry no QA verdict and cannot be sent,
     so this is clutter rather than risk.
@@ -866,19 +1000,21 @@ and nothing else.
 
 ## Sign-off
 
-**CONTROLLED TESTING.**
+**LOW-VOLUME PRODUCTION.**
 
-`e6d8e21` is deployed and verified — that blocker is closed.
+The system runs unattended. Every safety mechanism has been verified live, and
+the two open items (§23b Tests 1 and 5) need the clock and a restart, not more
+code.
 
-To reach **LOW-VOLUME PRODUCTION**, one decision is needed: how the pipeline
-advances without a human. Either an orchestrator cron (deliberately not
-installed here — starting a job that autonomously drives the whole pipeline is
-not a change to make silently during a release freeze, and it would advance the
-other in-flight leads too), or an owner who genuinely runs the tick on a
-schedule. Until one of those exists, the system is operated, not running.
+Two things to confirm when they become possible, neither blocking:
 
-To reach **BULK PRODUCTION**: the above, plus a provider-confirmed send from
-the current E2E, plus enough real volume to say something honest about
-deliverability, plus more than one warmed mailbox.
+- After the next UTC rollover, check that MailHub #20 and #21 sent and that the
+  leads moved to `SENT` on their own.
+- After the next Hermes restart, check `maya-orchestrator` is still scheduled.
+  If it ever is not, `install-agency.py` restores it by name.
+
+To reach **BULK PRODUCTION**: both of the above confirmed, more than one warmed
+mailbox, and enough real volume to say something honest about deliverability.
+Nothing here should be scaled up on the strength of thirteen leads.
 
 Bulk outreach is not enabled, and nothing in this phase enabled it.
