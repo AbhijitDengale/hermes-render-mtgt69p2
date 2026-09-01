@@ -153,9 +153,20 @@ def connect(path: str = None) -> sqlite3.Connection:
 
 def ensure_campaign(con: sqlite3.Connection, campaign_id: str) -> None:
     """Create the campaign if absent, so the foreign key holds and the unique
-    index always has a non-NULL campaign to work with."""
+    index always has a non-NULL campaign to work with.
+
+    Created 'active', not 'draft'. Now that a non-active campaign stops the
+    whole pipeline, a campaign conjured into existence by an import has to be
+    running: importing leads IS the intent to contact them, and a default of
+    'draft' would mean every fresh import silently stalled with nothing in the
+    logs to say why.
+
+    A campaign somebody creates deliberately still defaults to 'draft' — that
+    is the column default, and leaving it there is a considered choice to hold
+    the campaign back until it is activated.
+    """
     con.execute(
-        "INSERT OR IGNORE INTO campaigns (id, name, status) VALUES (?,?,'draft')",
+        "INSERT OR IGNORE INTO campaigns (id, name, status) VALUES (?,?,'active')",
         (campaign_id, campaign_id))
 
 

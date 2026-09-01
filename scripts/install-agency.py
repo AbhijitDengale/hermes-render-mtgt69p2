@@ -50,6 +50,11 @@ def discord(channel_id: str) -> str:
 # name -> (profile home, schedule, script, delivery)
 # Matched by name, so an existing job is left alone rather than duplicated.
 CRON_JOBS = {
+    # MAYA's orchestration tick: the job that makes the pipeline advance
+    # without a human. Deterministic, --no-agent, delivered locally because
+    # its output is a work log, not something to page anyone about.
+    "maya-orchestrator": (HERMES_HOME, "every 2m", "maya_orchestrator.py",
+                          "local"),
     "echo-followups": (HERMES_HOME / "profiles" / "echo", "every 2m",
                        "echo_followups.py", "local"),
     "review-alerts": (HERMES_HOME, "every 2m", "review_alerts.py",
@@ -63,6 +68,7 @@ CRON_JOBS = {
 
 # Cron wrappers: repo path -> where the profile expects to find it.
 WRAPPERS = {
+    "maya_orchestrator.py": HERMES_HOME / "scripts",
     "echo_followups.py": HERMES_HOME / "profiles" / "echo" / "scripts",
     "review_alerts.py": HERMES_HOME / "scripts",
     "orbit_daily.py": HERMES_HOME / "scripts",

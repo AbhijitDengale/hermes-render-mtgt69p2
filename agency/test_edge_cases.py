@@ -167,6 +167,69 @@ def main():
               F.blocked_reason(r) is None, str(F.blocked_reason(r)))
         check("  and is_paused agrees", not F.is_paused(r))
 
+    print()
+    print("--- A3. A paused campaign also stops MAYA, not just ECHO ---")
+    db = fresh(tmp)
+    with P.connect(db) as con:
+        # Two leads at the very start of the pipeline, one campaign running.
+        for lead, camp, status in (("L-GO", "C-GO", "active"),
+                                   ("L-NO", "C-NO", "paused")):
+            with P.writing(con):
+                con.execute("INSERT OR IGNORE INTO campaigns (id,name,status,"
+                            "followup_schedule) VALUES (?,?,?,?)",
+                            (camp, camp, status, '["2m"]'))
+                con.execute("INSERT INTO leads (id,campaign_id,email,"
+                            "business_name,state) VALUES (?,?, 'a@b.c','Co',"
+                            "'NEW')", (lead, camp))
+        got = {r["id"] for r in P.eligible(con, "NEW", 10)}
+        check("MAYA sees the running campaign's lead", "L-GO" in got, str(got))
+        check("  and NOT the paused campaign's lead", "L-NO" not in got, str(got))
+
+        # It must hold at every stage, not only at intake.
+        for state in ("RESEARCH_PENDING", "COPY_PENDING", "QA_PENDING",
+                      "READY_TO_SEND", "FOLLOWUP_PENDING"):
+            with P.writing(con):
+                con.execute("UPDATE leads SET state=? WHERE id IN ('L-GO','L-NO')",
+                            (state,))
+            got = {r["id"] for r in P.eligible(con, state, 10)}
+            check("  %-17s paused lead excluded" % state, "L-NO" not in got,
+                  str(got))
+
+        with P.writing(con):
+            con.execute("UPDATE campaigns SET status='active' WHERE id='C-NO'")
+        got = {r["id"] for r in P.eligible(con, "FOLLOWUP_PENDING", 10)}
+        check("resuming the campaign makes MAYA see it again",
+              "L-NO" in got, str(got))
+
+
+    print()
+    print("--- A4. Importing into a new campaign must not silently stall ---")
+    db = fresh(tmp)
+    con = li.connect(db)
+    try:
+        with con:
+            r = li.ingest_one(con, {"email": "new@example.com",
+                                    "business_name": "Brand New"},
+                              default_campaign="C-BRAND-NEW")
+            status = con.execute("SELECT status FROM campaigns WHERE id=?",
+                                 ("C-BRAND-NEW",)).fetchone()[0]
+    finally:
+        con.close()
+    check("an auto-created campaign is active, not draft",
+          status == "active", status)
+    with P.connect(db) as pcon:
+        got = {x["id"] for x in P.eligible(pcon, "NEW", 10)}
+        check("  so MAYA picks the imported lead up",
+              r["lead_id"] in got, str(got))
+        # A campaign somebody deliberately left as draft still holds.
+        with P.writing(pcon):
+            pcon.execute("UPDATE campaigns SET status='draft'"
+                         " WHERE id='C-BRAND-NEW'")
+        got = {x["id"] for x in P.eligible(pcon, "NEW", 10)}
+        check("  while a deliberately drafted campaign still holds",
+              r["lead_id"] not in got, str(got))
+
+
     # ---------------------------------------------------------------- B ---
     print("\n--- B. A re-ingested lead gets a fresh task generation ---")
     db = fresh(tmp)

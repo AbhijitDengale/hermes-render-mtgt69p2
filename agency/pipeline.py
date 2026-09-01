@@ -166,11 +166,27 @@ def release(con: sqlite3.Connection, lead_id: str, worker: str) -> None:
 
 def eligible(con: sqlite3.Connection, state: str,
              limit: int = 10) -> List[sqlite3.Row]:
-    """Unlocked leads sitting in `state`, oldest first."""
+    """Unlocked leads sitting in `state` whose campaign is running, oldest first.
+
+    The campaign check lives here rather than in each handler so that pausing a
+    campaign stops everything under it — research, copy, QA, queueing and
+    follow-ups alike — instead of stopping whichever stage somebody remembered
+    to guard. Only 'active' runs; draft, paused and archived do not. A lead
+    whose campaign row is missing is treated as running, because a bookkeeping
+    gap must not silently halt live outreach.
+
+    One thing a pause does NOT do: recall a message already handed to MailHub.
+    MailHub owns its queue and will deliver what it has accepted. Pausing stops
+    the agency creating anything new; to stop mail already in flight, disable
+    the mailbox in MailHub.
+    """
     return con.execute(
-        "SELECT * FROM leads "
-        " WHERE state=? AND (locked_until IS NULL OR locked_until < datetime('now')) "
-        " ORDER BY updated_at ASC LIMIT ?", (state, limit)).fetchall()
+        "SELECT l.* FROM leads l "
+        "  LEFT JOIN campaigns c ON c.id = l.campaign_id "
+        " WHERE l.state=? "
+        "   AND (l.locked_until IS NULL OR l.locked_until < datetime('now')) "
+        "   AND COALESCE(c.status, 'active') = 'active' "
+        " ORDER BY l.updated_at ASC LIMIT ?", (state, limit)).fetchall()
 
 
 def counts(con: sqlite3.Connection) -> Dict[str, int]:
