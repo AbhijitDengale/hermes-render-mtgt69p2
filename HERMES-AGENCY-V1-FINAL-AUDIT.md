@@ -10,24 +10,33 @@ No new features were added in this phase.
 
 > ### CONTROLLED TESTING
 >
-> Three things block the upgrade, all named in §24. One is a security fix that
-> is written, tested and pushed but **still not running**; one is a workflow
-> gap; one is simply a lack of evidence.
+> The security blocker is **resolved**: `e6d8e21` is deployed and the
+> suppression matrix passes 21/21 against the live API, with multi-tenant
+> isolation proved separately against the production database.
+>
+> One **critical workflow gap** remains, and it is why this is not production.
 
-The pipeline is complete and every safety mechanism has been verified against
-the live system. Both edge cases found by this audit are now fixed and covered
-by tests (§23a). What remains:
+Every safety mechanism has been verified against the live system, and both edge
+cases this audit found are fixed and covered by tests (§23a).
 
-1. **MailHub commit `e6d8e21` is not deployed.** Until it is, the `suppress`
-   scope is not enforced (§2).
-2. **Nothing advances `READY_TO_SEND` to `SENT` automatically** — the
-   orchestrator has no cron, so a confirmed send needs a manual tick (§24.9).
-   That is a genuine workflow gap, not just missing evidence.
-3. **Twelve leads and three real messages** say nothing about deliverability,
-   reply rate or spam placement.
+What stops it being production is not a missing feature — it is that **the
+pipeline does not advance on its own.** ECHO, review alerts and ORBIT are
+scheduled; the orchestrator is not. Nothing moves a lead from `READY_TO_SEND`
+to `SENT` after MailHub confirms, and nothing moves a due follow-up out of
+`FOLLOWUP_PENDING`. Both need somebody to run `orchestrator.py tick`. A system
+that requires a human to keep poking it is not running in production; it is
+being operated by hand.
 
-BULK PRODUCTION is not appropriate while (2) stands, regardless of how much
-volume is run.
+Also outstanding, but evidence rather than gaps:
+
+- The final E2E is **queued, not yet delivered** — the mailbox is at 5/5 and
+  the cap was not raised (§23).
+- Twelve leads and three real messages say nothing about deliverability, reply
+  rate or spam placement.
+- One warmed mailbox. Rotation has never been exercised.
+
+**BULK PRODUCTION is not appropriate** while the orchestrator gap stands,
+regardless of how much volume is run.
 
 ---
 
@@ -52,21 +61,22 @@ were backfilled into `lead_generations`.
 | | |
 |---|---|
 | Repository | `AbhijitDengale/Auto_Email` |
-| **Running** | `ea77499` |
-| **Pushed, not deployed** | `e6d8e21` — *Gate suppression behind its scope and fix per-tenant opt-out* |
+| **Running** | `e6d8e21` — *Gate suppression behind its scope and fix per-tenant opt-out* |
+| Deployed | manually, from the Render dashboard |
+| Migration | `20260901000005_suppression_tenancy.sql`, applied to production |
 
-**This is the release blocker.** `e6d8e21` is on `origin/main` and Render has not
-picked it up. Confirmed by reading the running container directly:
+**Deployed and verified.** Auto-deploy did not fire for this service; the
+commit sat on `origin/main` for around two hours until it was deployed by hand.
 
-```
-grep -c 'SUPPRESSION_REASONS' /srv/app/main.py        -> 0
-grep -c 'require_scope(caller, "suppress")' ...        -> 0
-```
+A note on how this was confirmed, because the first method was wrong. Reading
+`/srv/app/main.py` over Render SSH reported the old code long after the new
+code was live: **the SSH session attaches to a different instance than the one
+serving traffic**, so its filesystem is not evidence about what is running. The
+live API is. Verification below is entirely behavioural — real keys, real
+requests, real responses.
 
-Its database migration (`20260901000005_suppression_tenancy.sql`) **is** applied
-to production and is backwards-compatible, so nothing is broken in the meantime.
-But until the code deploys, any API key belonging to an admin or owner can add
-suppressions and cancel queued mail regardless of its scope.
+Anything that needs to answer "is this deployed?" should ask the API, not the
+container.
 
 ## 3. Hermes version
 
@@ -180,10 +190,57 @@ evidence protocol in NOVA's SOUL worked exactly as written.
 
 ## 9. MailHub status
 
-Running, healthy, `dry_run` off. One connected mailbox, `warming`, daily cap 5.
+Running `e6d8e21`, healthy, `dry_run` off. One connected mailbox, `warming`,
+daily cap 5.
 
 Warmup and rate-limit policy is **unchanged** — no cap was raised at any point
 during this phase.
+
+### 9a. Suppression verification matrix
+
+Twenty-one assertions against the deployed API, each made with a real key. No
+part of this is inferred from source.
+
+| Key | read | queue | approve | suppress |
+|---|---|---|---|---|
+| ORBIT (`read`) | **200** | 403 | 403 | **403** |
+| SENTINEL (`read,approve`) | **200** | 403 | — | **403** |
+| MAYA (`read,queue,suppress`) | — | — | 403 | **200** |
+| LEO (`read,suppress`) | **200** | 403 | 403 | **200** |
+
+Every refusal names the missing capability, e.g.
+`{"detail":"this key does not have the 'suppress' capability"}`.
+
+The row that matters most is SENTINEL: it can approve and cannot suppress or
+queue. **No key holds both `approve` and `queue`**, which is what makes the QA
+gate structural rather than advisory.
+
+Reason validation: all five valid reasons (`unsubscribed`, `bounced`,
+`do_not_contact`, `complaint`, `manual`) return `200`; an unknown reason returns
+**`400`** naming the valid options, where it previously reached the column's
+CHECK constraint and came back as a `500`.
+
+### 9b. Multi-tenant isolation
+
+Verified directly against the production schema, because the agency box holds
+one tenant's credentials and cannot honestly assert this through the API alone.
+Twelve checks, all passing:
+
+- `suppression_pkey` — the address-only primary key — **is gone**;
+  `suppression_owner_email_key` is the key, and `idx_suppression_email` keeps
+  the ownerless lookup fast.
+- Tenant A and tenant B both suppress the **same address**; both rows coexist.
+  This is the case that previously hit a unique violation
+  `ON CONFLICT (owner_user_id, email)` never saw and returned a `500`, leaving
+  the first tenant's opt-out effectively platform-wide.
+- An address on A's list is suppressed for A and **not** for B — no
+  cross-tenant leakage.
+- An ownerless check still sees it, which is the conservative direction: it can
+  only ever refuse to send.
+- No suppression row is ownerless.
+
+Probe rows were removed afterwards; the three remaining rows are genuine
+records from earlier phases.
 
 ## 10. State machine
 
@@ -424,7 +481,9 @@ authoritative in every case.
 | **Automated total** | **490 passed, 0 failed** |
 | Phase F live (on the box) | 30 passed, 0 failed |
 | Integrated scenario (on the box) | 22 passed, 0 failed |
-| **Grand total** | **542 passed, 0 failed** |
+| Suppression matrix (deployed API) | 21 passed, 0 failed |
+| Multi-tenant isolation (production DB) | 12 passed, 0 failed |
+| **Grand total** | **575 passed, 0 failed** |
 
 `test_v1_regressions.py` and `test_edge_cases.py` were also run **on the box**
 against the deployed code, not only locally: 29 and 37, both clean.
@@ -809,11 +868,17 @@ and nothing else.
 
 **CONTROLLED TESTING.**
 
-To reach **LOW-VOLUME PRODUCTION**: deploy `e6d8e21` and verify the suppression
-matrix, then decide how `READY_TO_SEND` should advance — either an orchestrator
-cron or a documented manual step someone actually performs.
+`e6d8e21` is deployed and verified — that blocker is closed.
 
-To reach **BULK PRODUCTION**: the above, plus enough real volume to say
-something honest about deliverability, plus more than one warmed mailbox.
+To reach **LOW-VOLUME PRODUCTION**, one decision is needed: how the pipeline
+advances without a human. Either an orchestrator cron (deliberately not
+installed here — starting a job that autonomously drives the whole pipeline is
+not a change to make silently during a release freeze, and it would advance the
+other in-flight leads too), or an owner who genuinely runs the tick on a
+schedule. Until one of those exists, the system is operated, not running.
+
+To reach **BULK PRODUCTION**: the above, plus a provider-confirmed send from
+the current E2E, plus enough real volume to say something honest about
+deliverability, plus more than one warmed mailbox.
 
 Bulk outreach is not enabled, and nothing in this phase enabled it.
