@@ -36,13 +36,16 @@ volume is run.
 | | |
 |---|---|
 | Repository | `AbhijitDengale/hermes-render-mtgt69p2` |
-| Commit | `9bf3009` — *Bring the repository level with the running agency, and make it installable* |
-| Previous | `508736e` |
-| Agency code on the box | byte-for-byte identical to `9bf3009`'s `agency/` |
+| Commit | `9c878f8` — *Make a pause actually pause, and let a re-ingested lead start over* |
+| Preceded by | `ba993e4`, `9bf3009`, `508736e` |
+| Agency code on the box | installed from `9c878f8` and verified byte-for-byte |
 
 Verified by installing from the repository onto the running container:
-`install-agency.py` reported **62 ok, 0 warnings, 0 failures**, and reported the
-same on a second run.
+`install-agency.py` reported **63 ok, 0 warnings, 0 failures**, and reported the
+same on a second run — including finding all three cron jobs already present
+rather than creating duplicates. Migration 005 applied cleanly; all five
+migrations are recorded in the `schema_migrations` ledger and all twelve leads
+were backfilled into `lead_generations`.
 
 ## 2. Deployed MailHub commit
 
