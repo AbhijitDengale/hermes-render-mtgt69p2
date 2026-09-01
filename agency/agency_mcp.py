@@ -340,6 +340,17 @@ def t_submit_classification(a: Dict[str, Any]) -> Dict[str, Any]:
                  (a.get("draft_reply") or "")[:4000],
                  1 if requires_human else 0, reply_id))
 
+        if lead_id:
+            # The reply itself is mirrored as soon as it is classified. The
+            # resulting lead state mirrors separately through transition(),
+            # so a classification that ends in HUMAN_REVIEW shows both.
+            try:
+                import supabase_sync
+                supabase_sync.enqueue(lead_id, "replied",
+                                      {"classification": cls}, con)
+            except Exception:
+                pass
+
         if not lead_id:
             return {"recorded": cls, "lead": None}
 

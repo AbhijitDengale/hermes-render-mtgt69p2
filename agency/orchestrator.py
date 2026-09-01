@@ -65,6 +65,19 @@ def mailhub(method: str, path: str,
 
 # --- Kanban -----------------------------------------------------------------
 
+def _mirror(con, lead_id: str, event: str, payload: dict) -> None:
+    """Queue a Supabase write-back. Never raises into the pipeline.
+
+    The work it describes has already happened and been committed; a mirror
+    that cannot be queued is a retry, not a reason to undo a real send.
+    """
+    try:
+        import supabase_sync
+        supabase_sync.enqueue(lead_id, event, payload, con)
+    except Exception:
+        pass
+
+
 def gen(lead) -> int:
     """This lead's lifecycle generation, or 1 if it predates the counter."""
     try:
@@ -289,6 +302,8 @@ def queue_and_send(con, lead) -> Optional[str]:
                 "UPDATE messages SET mailhub_queue_id=?, idempotency_key=?,"
                 "       status='queued', updated_at=datetime('now') WHERE id=?",
                 (str(res.get("id")), key, draft["id"]))
+        _mirror(con, lead["id"], "queued",
+                {"mailhub_message_id": res.get("id")})
         return "READY_TO_SEND: queued as MailHub #%s (%s)" % (
             res.get("id"), res.get("status"))
 
@@ -314,6 +329,11 @@ def queue_and_send(con, lead) -> Optional[str]:
                                             ("status", "provider_message_id",
                                              "provider_thread_id",
                                              "account_id")}))
+        # Only here, where the provider has confirmed. A queued message is
+        # not a sent one and the mirror must not claim otherwise.
+        _mirror(con, lead["id"], "sent",
+                {"provider_message_id": status.get("provider_message_id"),
+                 "provider_thread_id": status.get("provider_thread_id")})
         return "READY_TO_SEND -> SENT (%s, provider %s)" % (
             st, status.get("provider_message_id"))
     if st in ("failed", "dead", "needs_review", "cancelled"):
@@ -322,6 +342,8 @@ def queue_and_send(con, lead) -> Optional[str]:
                          "MailHub reported %s: %s"
                          % (st, (status.get("error") or "")[:160]),
                          expect="READY_TO_SEND")
+        _mirror(con, lead["id"], "send_failed",
+                {"error": (status.get("error") or st)[:300]})
         return "READY_TO_SEND -> ERROR (%s)" % st
     return None                          # still pending or claimed
 

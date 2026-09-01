@@ -133,7 +133,38 @@ def transition(con: sqlite3.Connection, lead_id: str, to_state: str,
         "VALUES (?,?,?,?,?,?,?)",
         (lead_id, lead["campaign_id"], agent, "state.changed", current,
          to_state, detail or reason or None))
+    _mirror(con, lead_id, to_state, reason)
     return {"changed": True, "from": current, "state": to_state}
+
+
+def _mirror(con: sqlite3.Connection, lead_id: str, to_state: str,
+            reason: str = None) -> None:
+    """Queue this state change for the Supabase mirror, if the lead came from it.
+
+    Deliberately swallows everything. The transition has already been written
+    and the event already recorded; a mirror that cannot be queued must not
+    turn a real state change into an exception, and must never be a reason to
+    roll back a message that has already left. Leads that did not come from
+    Supabase queue nothing.
+
+    Imported lazily so pipeline.py does not depend on the sync module — the
+    state machine has to work on a box where Supabase was never configured.
+    """
+    try:
+        row = con.execute("SELECT 1 FROM supabase_leads WHERE lead_id=?",
+                          (lead_id,)).fetchone()
+        if not row:
+            return
+        import supabase_sync
+        # The reason travels only for states that actually represent a
+        # failure; for everything else it is a normal explanatory note and
+        # belongs in events, not in the mirror's error column.
+        payload = {"state": to_state}
+        if to_state in ("ERROR", "BOUNCED") and reason:
+            payload["error"] = reason
+        supabase_sync.enqueue(lead_id, "state", payload, con)
+    except Exception:
+        pass
 
 
 # --- leasing ----------------------------------------------------------------

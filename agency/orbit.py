@@ -112,6 +112,10 @@ def collect(db: str = None) -> Dict[str, Any]:
         m["outbound_total"] = m["initial_sent"] + m["followups_sent"]
         m["send_failures"] = scalar(
             "SELECT COUNT(*) FROM messages WHERE status='failed'")
+        # Handed to MailHub, not yet confirmed by a provider. Deliberately
+        # distinct from sent: a queued message has not reached anybody.
+        m["queued"] = scalar(
+            "SELECT COUNT(*) FROM messages WHERE status='queued'")
 
         # Denominators are *people*, not messages. Counting raw sends lets a
         # lead who was emailed three times and replied twice produce a reply
@@ -207,6 +211,37 @@ def collect(db: str = None) -> Dict[str, Any]:
     m["sample"] = people
     m["min_sample"] = MIN_SAMPLE
 
+    # --- lead intake against the daily target ------------------------------
+    # Counted from agency.db, never asked of a model. The operational day is
+    # Asia/Kolkata so the target rolls over when the operator's day does.
+    try:
+        import supabase_sync as S
+        day = S.operational_day()
+        with P.connect(db) as con:
+            m["intake_day"] = day
+            m["intake_today"] = S.imported_today(con, day)
+            m["intake_target"] = S.DAILY_TARGET
+            m["intake_remaining"] = max(0, S.DAILY_TARGET - m["intake_today"])
+            m["outbox_pending"] = con.execute(
+                "SELECT COUNT(*) c FROM supabase_sync_outbox"
+                " WHERE status='pending'").fetchone()["c"]
+            m["outbox_failed"] = con.execute(
+                "SELECT COUNT(*) c FROM supabase_sync_outbox"
+                " WHERE status='failed'").fetchone()["c"]
+            m["supabase_mapped"] = con.execute(
+                "SELECT COUNT(*) c FROM supabase_leads").fetchone()["c"]
+        m["supabase_ready"] = S.ready_count()
+        m["timezone"] = S.TZ_NAME
+    except Exception as exc:
+        m["intake_error"] = "%s: %s" % (type(exc).__name__, exc)
+
+    # --- research throughput ------------------------------------------------
+    try:
+        import research_metrics as RM
+        m["research"] = RM.collect(db)
+    except Exception as exc:
+        m["research_error"] = "%s: %s" % (type(exc).__name__, exc)
+
     # --- sender health, from MailHub only ----------------------------------
     accounts = mailhub("/api/v1/accounts")
     m["senders"] = []
@@ -255,59 +290,169 @@ def best(rows: List[Dict[str, Any]]) -> str:
 
 
 def report(m: Dict[str, Any]) -> str:
-    L = ["**AGENCY DAILY**", ""]
-    L.append("Leads: %d   Research complete: %d   Research failed: %d"
-             % (m["leads"], m["research_complete"], m["research_failed"]))
-    L.append("Initial sent: %d   Follow-ups: %d   Total out: %d   Failures: %d"
-             % (m["initial_sent"], m["followups_sent"], m["outbound_total"],
-                m["send_failures"]))
-    L.append("Leads contacted: %d   Leads that replied: %d   (%d inbound total)"
-             % (m["leads_contacted"], m["leads_replied"], m["replies"]))
-    L.append("Positive: %d   Negative: %d   Meetings: %d"
-             % (m["positive_replies"], m["negative_replies"], m["meetings"]))
-    L.append("Unsubscribes: %d   Bounces: %d"
-             % (m["unsubscribes"], m["bounces"]))
-    L.append("")
-    r = m["rates"]
+    """The daily report, section by section.
+
+    Every figure is a count or a rate computed from a query. Nothing here is
+    written by a model, so the report cannot describe a day that did not
+    happen.
+    """
     n = m["sample"]
-    L.append("Reply rate:    %s" % pct(r["reply_rate"], n))
-    L.append("Positive rate: %s" % pct(r["positive_reply_rate"], n))
-    L.append("Bounce rate:   %s" % pct(r["bounce_rate"], n))
-    L.append("Unsub rate:    %s" % pct(r["unsubscribe_rate"], n))
+    r = m["rates"]
+    res = m.get("research") or {}
+
+    def pc(v):
+        return pct(v, n)
+
+    def num(v, suffix=""):
+        return "n/a" if v is None else ("%s%s" % (v, suffix))
+
+    def secs(v):
+        return "n/a" if v is None else "%.1fs" % v
+
+    L = ["**HERMES AGENCY — DAILY REPORT**", ""]
+    L.append("Date: %s  (%s)" % (m.get("intake_day", "—"),
+                                 m.get("timezone", "operational day")))
     L.append("")
-    L.append("Best campaign: %s" % best(m["by_campaign"]))
-    L.append("Best niche:    %s" % best(m["by_niche"]))
-    L.append("")
-    if m["sender_warnings"]:
-        L.append("Sender warnings:")
-        for w in m["sender_warnings"][:5]:
-            L.append("  - %s" % w)
+
+    # ---- LEADS -----------------------------------------------------------
+    L.append("**LEADS**")
+    ready = m.get("supabase_ready")
+    L.append("  Available in Supabase:      %s"
+             % ("unavailable" if ready is None else ready))
+    target = m.get("intake_target")
+    today = m.get("intake_today")
+    if target is not None and today is not None:
+        done = today >= target
+        L.append("  Daily lead target:          %d / %d%s"
+                 % (today, target, "  \u2705" if done else ""))
+        L.append("  Remaining:                  %d" % m.get("intake_remaining", 0))
+        if done:
+            L.append("  No further leads will be claimed until the next "
+                     "operational day.")
     else:
-        L.append("Sender warnings: none")
+        L.append("  Daily lead target:          not configured")
+    L.append("  Leads in Hermes:            %d" % m["leads"])
+    L.append("  Currently researching:      %d"
+             % (m["by_state"].get("RESEARCHING", 0)
+                + m["by_state"].get("RESEARCH_PENDING", 0)))
+    L.append("  Research completed:         %d" % m["research_complete"])
+    L.append("  Research failed / review:   %d" % m["research_failed"])
     L.append("")
-    L.append("Human reviews waiting: %d (of %d raised)"
+
+    # ---- OUTREACH --------------------------------------------------------
+    L.append("**OUTREACH**")
+    L.append("  Copy ready:                 %d" % m["by_state"].get("COPY_READY", 0))
+    L.append("  QA approved (ready):        %d" % m["by_state"].get("READY_TO_SEND", 0))
+    L.append("  QA rejected:                %d" % m["by_state"].get("QA_REJECTED", 0))
+    L.append("  Queued (awaiting provider): %d" % m.get("queued", 0))
+    L.append("  Sent (initial + follow-up): %d  (%d + %d)"
+             % (m["outbound_total"], m["initial_sent"], m["followups_sent"]))
+    L.append("  Send failed:                %d" % m["send_failures"])
+    L.append("")
+
+    # ---- REPLIES ---------------------------------------------------------
+    L.append("**REPLIES**")
+    L.append("  Leads contacted:            %d" % m["leads_contacted"])
+    L.append("  Leads that replied:         %d  (%d inbound total)"
+             % (m["leads_replied"], m["replies"]))
+    cls = m.get("by_classification") or {}
+    for label, key in (("Positive / interested", "positive"),
+                       ("Pricing", "pricing_question"),
+                       ("Meetings", "meeting_request"),
+                       ("Negative", "negative"),
+                       ("Out of office", "out_of_office"),
+                       ("Unsubscribe", "unsubscribe")):
+        if cls.get(key):
+            L.append("  %-27s %d" % (label + ":", cls[key]))
+    L.append("  Unsubscribed:               %d" % m["unsubscribes"])
+    L.append("  Bounced:                    %d" % m["bounces"])
+    L.append("  Human review open:          %d" % m["human_reviews_open"])
+    L.append("")
+
+    # ---- RATES -----------------------------------------------------------
+    # Numerator and denominator are drawn from the same population — leads
+    # actually contacted — so none of these can exceed 100%.
+    L.append("**RATES**  (of %d lead(s) contacted)" % n)
+    L.append("  Reply rate:                 %s" % pc(r["reply_rate"]))
+    L.append("  Positive rate:              %s" % pc(r["positive_reply_rate"]))
+    L.append("  Meeting rate:               %s" % pc(r["meeting_rate"]))
+    L.append("  Bounce rate:                %s" % pc(r["bounce_rate"]))
+    L.append("")
+
+    # ---- RESEARCH --------------------------------------------------------
+    L.append("**RESEARCH**")
+    if res.get("completed"):
+        L.append("  Average:                    %s" % secs(res.get("avg_seconds")))
+        L.append("  P50 / P95:                  %s / %s"
+                 % (secs(res.get("p50_seconds")), secs(res.get("p95_seconds"))))
+        L.append("  Cache hit rate:             %s"
+                 % ("n/a" if res.get("cache_hit_rate") is None
+                    else "%.1f%%" % res["cache_hit_rate"]))
+        L.append("  Steel success rate:         %s"
+                 % ("n/a" if res.get("steel_success_rate") is None
+                    else "%.1f%%" % res["steel_success_rate"]))
+        L.append("  Avg pages per lead:         %s"
+                 % num(res.get("avg_pages_per_lead")))
+    else:
+        L.append("  no research runs recorded yet")
+    L.append("")
+
+    # ---- MAILBOX ---------------------------------------------------------
+    # From MailHub, which is the only thing that knows what a provider did.
+    L.append("**MAILBOX**")
+    senders = m.get("senders") or []
+    if m.get("senders_error"):
+        L.append("  unavailable: %s" % m["senders_error"])
+    elif not senders:
+        L.append("  no mailboxes connected")
+    else:
+        active = [a for a in senders if a.get("enabled")]
+        warming = [a for a in senders if a.get("health") == "warming"]
+        paused = [a for a in senders if not a.get("enabled")]
+        sent_today = sum(a.get("sent_today") or 0 for a in senders)
+        cap = sum(a.get("effective_daily_limit") or 0 for a in senders)
+        L.append("  Mailboxes active:           %d of %d" % (len(active), len(senders)))
+        L.append("  Sent today:                 %d" % sent_today)
+        L.append("  Capacity today:             %d" % cap)
+        L.append("  Remaining safe capacity:    %d" % max(0, cap - sent_today))
+        L.append("  Warming:                    %d" % len(warming))
+        L.append("  Paused / blocked:           %d" % len(paused))
+    L.append("")
+
+    # ---- PIPELINE --------------------------------------------------------
+    L.append("**PIPELINE**")
+    L.append("  Supabase leads mapped:      %s" % num(m.get("supabase_mapped")))
+    L.append("  Sync pending:               %s" % num(m.get("outbox_pending")))
+    L.append("  Sync failures:              %s" % num(m.get("outbox_failed")))
+    L.append("  Human review open:          %d (of %d raised)"
              % (m["human_reviews_open"], m["human_reviews"]))
     if m.get("replies_unmatched"):
-        L.append("Note: %d inbound repl(y/ies) have no send on record — "
-                 "excluded from every rate above."
-                 % m["replies_unmatched"])
+        L.append("  Note: %d inbound repl(y/ies) have no send on record — "
+                 "excluded from every rate above." % m["replies_unmatched"])
+    if m.get("intake_error"):
+        L.append("  Intake metrics unavailable: %s" % m["intake_error"])
 
+    # ---- what needs a person --------------------------------------------
     recs = []
     if m["human_reviews_open"]:
         recs.append("%d escalation(s) need a decision — `review list`"
                     % m["human_reviews_open"])
+    if m.get("outbox_failed"):
+        recs.append("%d Supabase write-back(s) gave up after retrying — "
+                    "`supabase_sync.py reconcile`" % m["outbox_failed"])
     if n < MIN_SAMPLE:
         recs.append("Only %d lead(s) contacted. Rates from fewer than %d are "
                     "not meaningful; read the counts, not the percentages."
                     % (n, MIN_SAMPLE))
     if (r["bounce_rate"] or 0) > 3 and n >= MIN_SAMPLE:
-        recs.append("Bounce rate above 3% — pause and check list quality "
-                    "before sending more.")
+        recs.append("Bounce rate above 3% — pause and check list quality.")
+    for w in (m.get("sender_warnings") or [])[:3]:
+        recs.append(w)
     if m.get("senders_error"):
         recs.append("Sender health unavailable: %s" % m["senders_error"])
     if recs:
         L.append("")
-        L.append("Recommendations:")
+        L.append("**NEEDS ATTENTION**")
         for x in recs:
             L.append("  - %s" % x)
     return "\n".join(L)

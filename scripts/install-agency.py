@@ -57,6 +57,8 @@ CRON_JOBS = {
                           "local"),
     "echo-followups": (HERMES_HOME / "profiles" / "echo", "every 2m",
                        "echo_followups.py", "local"),
+    "supabase-lead-sync": (HERMES_HOME, "every 2m",
+                           "supabase_lead_sync.py", "local"),
     "review-alerts": (HERMES_HOME, "every 2m", "review_alerts.py",
                       discord(ALERTS_CHANNEL)),
     "orbit-daily": (HERMES_HOME, "0 8 * * *", "orbit_daily.py",
@@ -71,13 +73,14 @@ WRAPPERS = {
     "maya_orchestrator.py": HERMES_HOME / "scripts",
     "echo_followups.py": HERMES_HOME / "profiles" / "echo" / "scripts",
     "review_alerts.py": HERMES_HOME / "scripts",
+    "supabase_lead_sync.py": HERMES_HOME / "scripts",
     "orbit_daily.py": HERMES_HOME / "scripts",
 }
 
 MODULES = ("pipeline.py", "lead_ingest.py", "orchestrator.py", "followups.py",
            "inbound_processor.py", "echo_tick.py", "review.py",
            "review_tick.py", "orbit.py", "agency_mcp.py", "research_mcp.py",
-           "research_metrics.py",
+           "research_metrics.py", "supabase_sync.py",
            "schema.sql", "seed_state_transitions.sql")
 
 # Owned by the Auto_Email repository, not vendored here — one source of truth.
@@ -217,6 +220,10 @@ def apply_migrations(check: bool) -> None:
                 lambda: has_column("followups", "dispatched_at"),
             "005_campaign_pause_and_generation.sql":
                 lambda: has_column("followups", "last_blocked_reason"),
+            "007_supabase_sync.sql":
+                lambda: bool(con.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name='supabase_leads'"
+                    ).fetchone()),
             "006_research_budget.sql":
                 lambda: bool(con.execute(
                     "SELECT 1 FROM sqlite_master WHERE name='research_runs'"

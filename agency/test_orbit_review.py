@@ -106,9 +106,13 @@ def main() -> int:
     check("best() on no data says insufficient",
           orbit.best([]) == "insufficient data")
     txt = orbit.report(m)
-    check("a zero-data report still renders", "AGENCY DAILY" in txt)
-    check("and does not claim a best campaign",
-          "Best campaign: insufficient data" in txt)
+    check("a zero-data report still renders", "HERMES AGENCY" in txt)
+    check("  and every rate reads n/a rather than a fabricated zero",
+          txt.count("n/a") >= 4, "%d n/a" % txt.count("n/a"))
+    check("  it says plainly that the sample is too small",
+          "not meaningful" in txt)
+    check("  and it does not invent a research summary",
+          "no research runs recorded yet" in txt)
 
     print("\n--- 2. Division by zero is impossible ---")
     check("rate(0,0) is None", orbit.rate(0, 0) is None)
