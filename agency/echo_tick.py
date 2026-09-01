@@ -53,7 +53,7 @@ def tick(limit: int = 20) -> list:
                         (stage, lead_id))
                     P.transition(con, lead_id, "FOLLOWUP_PENDING", "echo",
                                  "follow-up %d is due" % stage)
-                    F.touch(con, fid)
+                    F.mark_dispatched(con, fid)
                 out.append("due  %s stage %d -> FOLLOWUP_PENDING" % (lead_id, stage))
             except P.TransitionError as exc:
                 # Losing this race is normal and safe: something else moved the

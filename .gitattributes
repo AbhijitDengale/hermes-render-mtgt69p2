@@ -1,0 +1,17 @@
+# The agency code is deployed to a Linux container and the installer compares
+# files byte-for-byte to decide whether anything changed. Without this, a
+# checkout on Windows rewrites every file with CRLF, the comparison never
+# matches, and each run reinstalls everything — shipping CRLF Python to the box.
+* text=auto eol=lf
+
+*.py   text eol=lf
+*.sql  text eol=lf
+*.sh   text eol=lf
+*.md   text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf
+*.json text eol=lf
+
+*.png  binary
+*.jpg  binary
+*.gz   binary

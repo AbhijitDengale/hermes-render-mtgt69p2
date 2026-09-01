@@ -114,6 +114,9 @@ def cancel_all(con: sqlite3.Connection, lead_id: str, reason: str,
 
 def due(con: sqlite3.Connection, limit: int = 20) -> List[sqlite3.Row]:
     """Scheduled follow-ups whose time has come."""
+    # Only 'scheduled' is eligible. Once ECHO has handed a stage to the
+    # pipeline it becomes 'dispatched' and stops appearing here, so later ticks
+    # neither re-evaluate it nor inflate its attempt count.
     return con.execute(
         "SELECT f.*, l.state AS lead_state, l.ooo_until, l.email AS lead_email "
         "  FROM followups f JOIN leads l ON l.id = f.lead_id "
@@ -138,6 +141,28 @@ def blocked_reason(row: sqlite3.Row) -> Optional[str]:
     if ooo and ooo > _iso(_now()):
         return "out of office until %s" % ooo
     return None
+
+
+
+def mark_dispatched(con: sqlite3.Connection, followup_id: str) -> None:
+    """ECHO has handed this stage to the pipeline.
+
+    Recording it here is what stops the next tick counting the same handover
+    again. The state machine already made a repeat transition impossible; this
+    makes the bookkeeping honest about it.
+    """
+    con.execute(
+        "UPDATE followups SET status='dispatched',"
+        "       dispatched_at=datetime('now'),"
+        "       last_execution_at=datetime('now'), attempts=attempts+1 "
+        " WHERE id=? AND status='scheduled'", (followup_id,))
+
+
+def mark_status(con: sqlite3.Connection, followup_id: str, status: str) -> None:
+    """Advance a dispatched follow-up through the rest of its lifecycle."""
+    con.execute(
+        "UPDATE followups SET status=?, last_execution_at=datetime('now') "
+        " WHERE id=?", (status, followup_id))
 
 
 def mark_sent(con: sqlite3.Connection, followup_id: str,

@@ -37,3 +37,43 @@ npm-debug.log*
 
 # Local upstream clone used during template development.
 .hermes-upstream/
+
+# ---------------------------------------------------------------------------
+# Runtime state. Git holds code and schema; the persistent disk holds data.
+# Mixing them is how a redeploy ends up clobbering live campaign state.
+# ---------------------------------------------------------------------------
+*.db
+*.db-shm
+*.db-wal
+*.db.bak*
+agency.db
+kanban.db
+state.db
+response_store.db
+projects.db
+cron/
+sessions/
+memories/
+logs/
+cache/
+image_cache/
+audio_cache/
+sandboxes/
+workspace/
+plugin-data/
+research_cache/
+channel_directory.json
+discord_threads.json
+gateway_state.json
+spawn-ledger.json
+*.lock
+*.pid
+
+# Profile secrets. Every profile keeps its own; none of them belong here.
+profiles/*/.env
+.review.env
+*.secrets
+render.env*
+
+# Build artifacts that duplicate a committed source file.
+combined.sql
