@@ -35,6 +35,19 @@ CREATE TABLE IF NOT EXISTS campaigns (
 -- ---------------------------------------------------------------------
 -- sender_accounts — 12+ mailboxes. NO passwords here.
 -- ---------------------------------------------------------------------
+-- ===========================================================================
+-- DEPRECATED / NON-AUTHORITATIVE.
+--
+-- MailHub owns mail. This table predates that split and is kept only so an
+-- old database still opens; it is empty, nothing in production reads or
+-- writes it, and nothing may start. The authority is:
+--
+--   sender accounts, outbound queue, provider message and thread ids,
+--   inbound mail, suppression, delivery state  ->  MailHub / Supabase
+--
+-- Do not reintroduce reads here. Two sources of truth for what was sent is
+-- how a prospect gets mailed twice.
+-- ===========================================================================
 CREATE TABLE IF NOT EXISTS sender_accounts (
     id                  TEXT PRIMARY KEY,          -- slug, e.g. 'acct_ops1'
     email               TEXT NOT NULL UNIQUE,
@@ -132,6 +145,19 @@ CREATE TABLE IF NOT EXISTS state_transitions (
 -- ---------------------------------------------------------------------
 -- suppression — checked before EVERY send. Fail closed.
 -- ---------------------------------------------------------------------
+-- ===========================================================================
+-- DEPRECATED / NON-AUTHORITATIVE.
+--
+-- MailHub owns mail. This table predates that split and is kept only so an
+-- old database still opens; it is empty, nothing in production reads or
+-- writes it, and nothing may start. The authority is:
+--
+--   sender accounts, outbound queue, provider message and thread ids,
+--   inbound mail, suppression, delivery state  ->  MailHub / Supabase
+--
+-- Do not reintroduce reads here. Two sources of truth for what was sent is
+-- how a prospect gets mailed twice.
+-- ===========================================================================
 CREATE TABLE IF NOT EXISTS suppression (
     email               TEXT PRIMARY KEY,          -- store lowercased
     reason              TEXT NOT NULL
@@ -201,6 +227,19 @@ CREATE INDEX IF NOT EXISTS idx_messages_lead ON messages(lead_id);
 -- send_jobs — outbox. Idempotency across Render restarts.
 -- A restart mid-send can NEVER produce a duplicate email.
 -- ---------------------------------------------------------------------
+-- ===========================================================================
+-- DEPRECATED / NON-AUTHORITATIVE.
+--
+-- MailHub owns mail. This table predates that split and is kept only so an
+-- old database still opens; it is empty, nothing in production reads or
+-- writes it, and nothing may start. The authority is:
+--
+--   sender accounts, outbound queue, provider message and thread ids,
+--   inbound mail, suppression, delivery state  ->  MailHub / Supabase
+--
+-- Do not reintroduce reads here. Two sources of truth for what was sent is
+-- how a prospect gets mailed twice.
+-- ===========================================================================
 CREATE TABLE IF NOT EXISTS send_jobs (
     id                  TEXT PRIMARY KEY,
     idempotency_key     TEXT NOT NULL UNIQUE,   -- lead_id:kind:stage

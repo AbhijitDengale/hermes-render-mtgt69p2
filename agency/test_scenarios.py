@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """Scenario tests for the agency data layer.
 
-Exercises the fail-safe rules against a REAL copy of agency.db. Every test
-runs inside a transaction that is rolled back, so the live database is never
-mutated.
+LEGACY. These exercise the pre-MailHub mail tables (sender_accounts,
+send_jobs, suppression), which are now deprecated and empty — MailHub owns
+all of that. The suite is kept because its state-machine and fail-safe
+assertions are still meaningful, and because it is the only coverage of
+those tables should anyone be tempted to revive them.
 
-Run: python3 test_scenarios.py
+Requires a real agency.db and rolls every write back, so it runs on the box
+and not against a throwaway fixture.
+
+Run: AGENCY_DB=/opt/data/agency.db python3 test_scenarios.py
 """
 
 import sqlite3
