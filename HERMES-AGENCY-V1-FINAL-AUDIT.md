@@ -655,13 +655,27 @@ the mailbox does not have; everything after that is real.
 12:10:00  ECHO   FOLLOWUP_WAITING -> FOLLOWUP_PENDING   follow-up 1 is due
 12:11:03  MAYA   dispatched ARIA for stage 1
 12:14:03  MAYA   FOLLOWUP_PENDING -> QA_PENDING         follow-up 1 drafted
-          SENTINEL rejected it
-12:2x     MAYA   QA_PENDING       -> COPY_PENDING       back to ARIA to rewrite
+12:20:02  SENTINEL QA_PENDING     -> QA_REJECTED        "Draft asserts prior
+                                                         contact ('Following
+                                                         up on…')"
+12:20:02  MAYA   QA_REJECTED      -> COPY_PENDING       returned to ARIA
+12:26:03  ARIA   COPY_PENDING     -> COPY_READY         rewritten
+12:26:03  MAYA   COPY_READY       -> QA_PENDING         sent for QA again
+12:29:03  SENTINEL QA_PENDING     -> READY_TO_SEND      approval 9
+          MAYA   READY_TO_SEND       queued as MailHub #22
 ```
 
-The rejection is the interesting part. SENTINEL turned down the follow-up and
-MAYA sent it back for a rewrite without anybody intervening — the QA gate
-holding under autonomy, not just under supervision.
+The rejection is the interesting part, and it went the whole way round without
+anybody intervening. SENTINEL turned the draft down for asserting a prior
+conversation that had not happened — the seeded first message was synthetic and
+ARIA had opened with *"Following up on…"*. MAYA returned it to ARIA, ARIA
+rewrote it (the subject went from *"Quick follow-up: Linear"* to *"Linear /
+growth and outbound strategy"*, dropping the false premise), SENTINEL approved
+the new text as approval 9, and MAYA queued it.
+
+Nineteen minutes, five cron runs, one caught falsehood, no human. The QA gate
+holds under autonomy, not only under supervision — and ARIA answered the
+specific objection rather than resubmitting the same claim.
 
 ### TEST 4 — pause and resume
 
