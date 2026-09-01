@@ -727,6 +727,147 @@ through a restart, having been created at 12:05. The mechanism is proven; this
 particular job's use of it is inferred. Restarting the Hermes service from the
 Render dashboard would close it in one step.
 
+## 23c. Live autonomy verification against the installed job
+
+Run against `maya-orchestrator` `6416a10f0628` as it already stood. The job was
+not recreated, reinstalled or modified.
+
+### No manual tick was used — proven, not asserted
+
+The claim that the cron did this rests on there being no hand-run in the middle
+of it, so it is checked rather than promised. `live/no_manual_tick.py` reads
+every `state.changed` event MAYA recorded since the job was created and looks
+for each one in the stdout Hermes stored for a cron run. Anything MAYA did that
+is not in a cron output file was driven by hand.
+
+```
+cron run output files: 16
+MAYA transitions since the cron was installed: 19
+transitions NOT attributable to a recorded cron run: 0
+```
+
+### Follow-up chain, twice, including two rejections
+
+`L-T4-PAUSE` is the clearest single timeline in this audit, because it covers
+the pause, the resume and a rejection in one run:
+
+```
+12:10:00  ECHO   stage 1 held: campaign C-T4-PAUSE is paused
+          … twelve minutes paused, many ECHO ticks, ONE event …
+12:22:02  ECHO   FOLLOWUP_WAITING -> FOLLOWUP_PENDING   picked up on resume
+12:23:06  MAYA   dispatched ARIA for stage 1
+12:26:07  MAYA   FOLLOWUP_PENDING -> QA_PENDING
+12:32:04  SENTINEL QA_PENDING     -> QA_REJECTED   "Asserts prior contact
+                                                    ('Following up on my n…')"
+12:32:04  MAYA   QA_REJECTED      -> COPY_PENDING  returned to ARIA
+12:38:05  ARIA   COPY_PENDING     -> COPY_READY    rewritten
+12:38:05  MAYA   COPY_READY       -> QA_PENDING
+12:41:05  SENTINEL QA_PENDING     -> READY_TO_SEND approval 10
+          MAYA   queued as MailHub #23 — "Basecamp — quick question"
+```
+
+`L-T3-FOLLOWUP` ran the same shape independently and was rejected for the same
+thing: both drafts opened by referring to a conversation that had not happened,
+because both leads' first messages were seeded. **SENTINEL caught the same
+fabrication twice, in two separate leads, with nobody watching** — and in both
+cases ARIA's rewrite dropped the false premise rather than restating it.
+
+### Paused campaign, from the very first handler
+
+The earlier pause test used a lead already at `FOLLOWUP_WAITING`. This one
+starts at `NEW`, so it exercises `admit` — MAYA will not even take a paused
+campaign's lead into the pipeline. The campaign was created paused *before* the
+lead existed, so there was no window in which the cron could have picked it up.
+
+`L-91eac2064bbbd036`, campaign `C-T5-PAUSED-NEW`:
+
+```
+12:53:46  ingest              NEW    campaign paused; one event, its own ingestion
+          … cron runs at 12:56, 12:59, 13:02, 13:05 — none of them touched it …
+13:07:30  campaign resumed
+13:08:17  MAYA  NEW              -> RESEARCH_PENDING   admitted
+13:08:19  MAYA  RESEARCH_PENDING -> RESEARCHING        Kanban t_f5a2e79a -> NOVA
+```
+
+Fourteen minutes and four cron runs of nothing while paused — `eligible(NEW)`
+excluded it throughout — then picked up on the first tick after the resume.
+
+### What could not be verified here
+
+**`READY_TO_SEND` → `SENT`.** Four messages are queued and approved:
+
+| queue | lead | approval | subject |
+|---|---|---|---|
+| #20 | `L-617a6cec…` | 7 | Plausible Analytics & privacy migrations |
+| #21 | `L-fd990c7a…` | 8 | Question about PostHog's context warehouse |
+| #22 | `L-T3-FOLLOWUP` | 9 | Linear / growth and outbound strategy |
+| #23 | `L-T4-PAUSE` | 10 | Basecamp — quick question |
+
+The mailbox is at **5/5** and `sent_today` resets when the calendar date rolls
+over in Postgres. The cap was not raised. `live/verify_autonomous_send.py`
+completes this check in one command afterwards: it asks MailHub whether each
+message was really handed to Gmail, then checks the agency recorded the
+provider id, moved the lead off `READY_TO_SEND`, and has a cron run on record
+for doing it.
+
+### Restart — passed, on a restart nobody scheduled
+
+I could not force one. Three routes were tried and all hit the same wall: the
+Render SSH session runs in a different PID namespace from the gateway, so
+`kill -TERM` had no effect, `kill -9` returned **exit 1 as root** with the
+process untouched, and `hermes gateway stop` did nothing because it targets a
+systemd/launchd service while this gateway is a foreground process under s6.
+`/proc/<pid>/ns/pid` is unreadable for that pid, which confirms the boundary.
+A fourth route, `hermes gateway run --replace`, was deliberately not taken: it
+would have displaced the running gateway with one owned by an SSH session and
+unsupervised by s6, which dies on disconnect. That is worse than leaving a test
+unrun.
+
+Then one happened anyway. **The gateway restarted at 12:41:59 UTC** — recorded
+in `gateway-starts.log`, corroborated by the process start time moving from
+09:07:11 to 12:41:56, and by `/tmp` being wiped. I did not schedule it and
+cannot say what caused it; the plausible candidates are the platform recycling
+the instance or a delayed effect of the earlier signals. What matters is that
+it was a real restart, unplanned, with work in flight.
+
+`maya-orchestrator` was created at **12:05:23**, so it existed before the
+restart and had to survive it. It did:
+
+```
+runs before : 12-08-02  12-11-04  12-14-03  12-17-07  12-20-04  12-23-08
+              12-26-07  12-29-11  12-32-08  12-35-10  12-38-10  12-41-13
+   ---- gateway restarted 12:41:59 ----
+runs after  : 12-44-18  12-47-19  12-50-20  12-53-20  12-56-21  12-59-21
+              13-02-22  13-05-22  13-08-24  13-11-25
+```
+
+Unbroken on a two-to-three minute cadence, twenty-two runs in total, and the
+first tick after the restart was on schedule. The job is `enabled`,
+`scheduled`, `failure_streak=0`, and there is **exactly one** job named
+`maya-orchestrator` — the restart produced no duplicate.
+
+Leads were mid-flight when it happened: one at `NEW` in a paused campaign and
+several at `READY_TO_SEND`. Checked afterwards, across the restart boundary:
+
+- no duplicate message row
+- no MailHub queue id used twice (7 in use)
+- no provider id against two messages
+- no approval consumed twice
+- no lead entering the same state twice consecutively
+- no duplicate follow-up stage
+- no duplicate Kanban task across **44** keyed tasks
+
+`echo-followups` came through the same restart, now at 145 runs across twelve
+recorded gateway starts.
+
+### Nothing duplicated
+
+Re-checked after the cron had been running for an hour: no duplicate message
+row, no MailHub queue id used twice, no provider id against two messages, no
+approval consumed twice, no lead entering the same state twice consecutively,
+no duplicate follow-up stage, and no duplicate Kanban task across 42 keyed
+tasks.
+
 ## 23a. The two edge cases, fixed
 
 Both were found by this audit and both are now closed, with migration 005 and
