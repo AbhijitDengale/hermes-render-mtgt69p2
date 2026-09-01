@@ -77,6 +77,7 @@ WRAPPERS = {
 MODULES = ("pipeline.py", "lead_ingest.py", "orchestrator.py", "followups.py",
            "inbound_processor.py", "echo_tick.py", "review.py",
            "review_tick.py", "orbit.py", "agency_mcp.py", "research_mcp.py",
+           "research_metrics.py",
            "schema.sql", "seed_state_transitions.sql")
 
 # Owned by the Auto_Email repository, not vendored here — one source of truth.
@@ -216,6 +217,10 @@ def apply_migrations(check: bool) -> None:
                 lambda: has_column("followups", "dispatched_at"),
             "005_campaign_pause_and_generation.sql":
                 lambda: has_column("followups", "last_blocked_reason"),
+            "006_research_budget.sql":
+                lambda: bool(con.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name='research_runs'"
+                    ).fetchone()),
         }
 
         applied = {r[0] for r in con.execute(

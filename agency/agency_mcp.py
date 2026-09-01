@@ -161,6 +161,17 @@ def t_save_research(a: Dict[str, Any]) -> Dict[str, Any]:
                 return {"error": "every observation needs source_url and evidence"}
         with P.writing(con):
             P.save_research(con, lead_id, research)
+        # Close the timing record. The duration is measured by the research
+        # server from the lead's first fetch, not reported by the agent, so it
+        # cannot be flattered.
+        with P.writing(con):
+            con.execute(
+                "UPDATE research_runs SET completed_at=datetime('now'),"
+                "  observations_count=?, research_status=?,"
+                "  duration_ms=COALESCE(duration_ms,"
+                "    CAST((julianday('now') - julianday(started_at))"
+                "         * 86400000 AS INTEGER))"
+                " WHERE lead_id=?", (len(obs), status, lead_id))
     return {"saved": True, "lead_id": lead_id, "status": status,
             "observations": len(obs)}
 

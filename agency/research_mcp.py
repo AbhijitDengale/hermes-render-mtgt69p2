@@ -42,8 +42,30 @@ from typing import Any, Dict, List, Optional
 
 DB_PATH = os.getenv("AGENCY_DB", "/opt/data/agency.db")
 PROVIDER_NAME = os.getenv("BROWSER_PROVIDER", "steel").strip().lower()
-MAX_CONCURRENCY = int(os.getenv("BROWSER_MAX_CONCURRENCY", "2"))
-TIMEOUT_S = int(os.getenv("BROWSER_TIMEOUT_SECONDS", "45"))
+MAX_CONCURRENCY = int(os.getenv("BROWSER_MAX_CONCURRENCY", "6"))
+TIMEOUT_S = int(os.getenv("BROWSER_TIMEOUT_SECONDS", "18"))
+
+# --- per-lead research budget ----------------------------------------------
+# One slow site used to be able to hold a lead for minutes: each fetch had its
+# own timeout and nothing tracked the lead as a whole. These bound the entire
+# research lifecycle for one lead, not a single request.
+#
+# TARGET is what we aim for and report against; HARD_LIMIT is where research
+# stops whatever it has. SAVE_MARGIN is kept back so there is always time to
+# write the findings down — running the clock to zero and then failing to save
+# would waste the work as well as the time.
+TARGET_SECONDS = float(os.getenv("NOVA_RESEARCH_TARGET_SECONDS", "30"))
+HARD_LIMIT_SECONDS = float(os.getenv("NOVA_RESEARCH_HARD_LIMIT_SECONDS", "40"))
+SAVE_MARGIN_SECONDS = float(os.getenv("NOVA_RESEARCH_SAVE_MARGIN_SECONDS", "3"))
+MAX_PAGES_PER_LEAD = int(os.getenv("NOVA_MAX_PAGES_PER_LEAD", "3"))
+
+# Evidence thresholds. Enforced by NOVA's own stopping rule rather than here —
+# the server cannot judge whether an observation is any good — but exposed
+# through research_status so the agent is told the same numbers the operator
+# configured, instead of carrying them in its prompt.
+MIN_OBSERVATIONS = int(os.getenv("NOVA_MIN_OBSERVATIONS", "3"))
+TARGET_OBSERVATIONS = int(os.getenv("NOVA_TARGET_OBSERVATIONS", "4"))
+MAX_OBSERVATIONS = int(os.getenv("NOVA_MAX_OBSERVATIONS", "5"))
 CACHE_TTL_H = int(os.getenv("BROWSER_CACHE_TTL_HOURS", "168"))
 PER_DOMAIN_MIN_INTERVAL_S = float(os.getenv("BROWSER_DOMAIN_INTERVAL_SECONDS", "2"))
 MAX_BYTES = int(os.getenv("BROWSER_MAX_BYTES", "2000000"))
@@ -139,6 +161,115 @@ def _throttle(domain: str) -> None:
 
 
 # ----------------------------------------------------------------------------
+# Per-lead budget
+# ----------------------------------------------------------------------------
+
+_budget_lock = threading.Lock()
+_budgets: Dict[str, Dict[str, Any]] = {}
+
+
+def _budget(lead_id: str) -> Dict[str, Any]:
+    """The running budget for a lead, started on first contact.
+
+    Keyed by lead, not by thread, because six leads research concurrently and
+    each one's clock has to be its own.
+    """
+    with _budget_lock:
+        b = _budgets.get(lead_id)
+        if b is None:
+            b = {"started": time.time(), "pages": 0, "cache_hits": 0,
+                 "succeeded": 0, "failed": 0, "refused": 0,
+                 "fetch_seconds": 0.0, "exhausted": False}
+            _budgets[lead_id] = b
+            _run_start(lead_id)
+        return b
+
+
+def _elapsed(b: Dict[str, Any]) -> float:
+    return time.time() - b["started"]
+
+
+def _remaining(b: Dict[str, Any]) -> float:
+    return HARD_LIMIT_SECONDS - _elapsed(b)
+
+
+def budget_state(lead_id: str) -> Dict[str, Any]:
+    """What NOVA is allowed to do next, in numbers rather than prose."""
+    b = _budget(lead_id)
+    with _budget_lock:
+        elapsed = _elapsed(b)
+        remaining = max(0.0, HARD_LIMIT_SECONDS - elapsed)
+        usable = max(0.0, remaining - SAVE_MARGIN_SECONDS)
+        return {
+            "lead_id": lead_id,
+            "elapsed_seconds": round(elapsed, 2),
+            "remaining_seconds": round(remaining, 2),
+            "usable_seconds": round(usable, 2),
+            "target_seconds": TARGET_SECONDS,
+            "hard_limit_seconds": HARD_LIMIT_SECONDS,
+            "pages_fetched": b["pages"],
+            "pages_remaining": max(0, MAX_PAGES_PER_LEAD - b["pages"]),
+            "max_pages": MAX_PAGES_PER_LEAD,
+            "cache_hits": b["cache_hits"],
+            "min_observations": MIN_OBSERVATIONS,
+            "target_observations": TARGET_OBSERVATIONS,
+            "max_observations": MAX_OBSERVATIONS,
+            "may_fetch": bool(usable > 0 and b["pages"] < MAX_PAGES_PER_LEAD),
+            "stop_reason": (
+                "page limit reached" if b["pages"] >= MAX_PAGES_PER_LEAD else
+                "time budget exhausted" if usable <= 0 else None),
+        }
+
+
+def _run_start(lead_id: str) -> None:
+    try:
+        with _db() as con:
+            con.execute(
+                "INSERT INTO research_runs (lead_id, started_at) "
+                "VALUES (?, datetime('now')) "
+                "ON CONFLICT(lead_id) DO UPDATE SET started_at=datetime('now'),"
+                "  completed_at=NULL, duration_ms=NULL, pages_attempted=0,"
+                "  pages_succeeded=0, pages_from_cache=0, pages_failed=0,"
+                "  pages_refused=0, observations_count=NULL, budget_exhausted=0,"
+                "  timed_out=0, research_status=NULL, fetch_seconds=0",
+                (lead_id,))
+    except Exception:
+        pass          # measurement must never break research
+
+
+def _run_update(lead_id: str, b: Dict[str, Any]) -> None:
+    """Persist the counters, from a snapshot taken under the lock.
+
+    Reading b field by field while another thread is incrementing it is how a
+    page goes missing: two threads read the same total, both write it back, and
+    one increment is lost. Six leads research at once, so this is not
+    theoretical — it cost one page in twelve when the snapshot was taken
+    outside the lock.
+    """
+    with _budget_lock:
+        snap = (b["pages"], b["succeeded"], b["cache_hits"], b["failed"],
+                b["refused"], 1 if b["exhausted"] else 0,
+                round(b["fetch_seconds"], 3), int(_elapsed(b) * 1000))
+    try:
+        with _db() as con:
+            # max() so a late-arriving stale snapshot cannot walk a counter
+            # backwards; the counters only ever grow.
+            con.execute(
+                "UPDATE research_runs SET"
+                "  pages_attempted=MAX(pages_attempted, ?),"
+                "  pages_succeeded=MAX(pages_succeeded, ?),"
+                "  pages_from_cache=MAX(pages_from_cache, ?),"
+                "  pages_failed=MAX(pages_failed, ?),"
+                "  pages_refused=MAX(pages_refused, ?),"
+                "  budget_exhausted=MAX(budget_exhausted, ?),"
+                "  fetch_seconds=MAX(fetch_seconds, ?),"
+                "  duration_ms=MAX(COALESCE(duration_ms, 0), ?)"
+                " WHERE lead_id=?", snap + (lead_id,))
+    except Exception:
+        pass
+
+
+# ----------------------------------------------------------------------------
 # Persistence
 # ----------------------------------------------------------------------------
 
@@ -213,8 +344,13 @@ class BrowserProvider(ABC):
     def health_check(self) -> Dict[str, Any]: ...
 
     @abstractmethod
-    def fetch(self, url: str, formats: List[str]) -> Dict[str, Any]:
-        """Return {markdown?, html?, links[], metadata{}} for a validated URL."""
+    def fetch(self, url: str, formats: List[str],
+              timeout: Optional[int] = None) -> Dict[str, Any]:
+        """Return {markdown?, html?, links[], metadata{}} for a validated URL.
+
+        `timeout` is the caller's ceiling, which may be lower than the
+        configured default when a lead's research budget is nearly spent.
+        """
 
     @abstractmethod
     def screenshot(self, url: str) -> Dict[str, Any]: ...
@@ -254,8 +390,10 @@ class SteelBrowserProvider(BrowserProvider):
             return {"provider": self.name, "healthy": False,
                     "error": type(exc).__name__}
 
-    def fetch(self, url: str, formats: List[str]) -> Dict[str, Any]:
-        out = self._post("/v1/scrape", {"url": url, "format": formats}, TIMEOUT_S)
+    def fetch(self, url: str, formats: List[str],
+              timeout: Optional[int] = None) -> Dict[str, Any]:
+        out = self._post("/v1/scrape", {"url": url, "format": formats},
+                         int(timeout or TIMEOUT_S))
         content = out.get("content") or {}
         meta = out.get("metadata") or {}
         return {
@@ -293,7 +431,11 @@ def get_provider() -> BrowserProvider:
 
 def research_fetch(url: str, lead_id: Optional[str] = None,
                    page_type: str = "other", refresh: bool = False) -> Dict[str, Any]:
-    """Validated, throttled, cached, audited page fetch."""
+    """Validated, throttled, cached, audited, budgeted page fetch.
+
+    The budget is enforced here rather than trusted to the agent. NOVA decides
+    which pages are worth reading; it does not decide how long it may take.
+    """
     started = time.time()
     try:
         safe = validate_url(url)
@@ -301,35 +443,114 @@ def research_fetch(url: str, lead_id: Optional[str] = None,
         _audit(lead_id, url, "browser", "blocked", None, 0, 0, str(exc))
         return {"status": "blocked", "url": url, "error": str(exc)}
 
+    b = _budget(lead_id) if lead_id else None
+
+    # --- cache first, and free ---------------------------------------------
+    # Checked before any budget arithmetic: a cached page costs no Steel call
+    # and effectively no time, so refusing one on time grounds would throw away
+    # evidence for nothing.
     if not refresh:
         hit = _cache_get(safe)
         if hit:
+            if b is not None:
+                with _budget_lock:
+                    b["pages"] += 1
+                    b["cache_hits"] += 1
+                    b["succeeded"] += 1
+                _run_update(lead_id, b)
             _audit(lead_id, safe, "cache", "ok", 200, 0, 0, None)
             hit["status"] = "ok"
+            hit["source"] = "cache"
+            hit["_cached"] = True
             return hit
 
+    # --- budget gates -------------------------------------------------------
+    if b is not None:
+        with _budget_lock:
+            pages = b["pages"]
+        if pages >= MAX_PAGES_PER_LEAD:
+            with _budget_lock:
+                b["refused"] += 1
+            _run_update(lead_id, b)
+            _audit(lead_id, safe, "browser", "refused", None, 0, 0,
+                   "page limit %d reached" % MAX_PAGES_PER_LEAD)
+            return {"status": "budget_exhausted", "url": safe,
+                    "reason": "page_limit",
+                    "error": "already read %d pages for this lead; finalise with "
+                             "the evidence you have" % pages,
+                    "budget": budget_state(lead_id)}
+
+        usable = _remaining(b) - SAVE_MARGIN_SECONDS
+        if usable <= 0:
+            with _budget_lock:
+                b["refused"] += 1
+                b["exhausted"] = True
+            _run_update(lead_id, b)
+            _audit(lead_id, safe, "browser", "refused", None, 0, 0,
+                   "budget exhausted")
+            return {"status": "budget_exhausted", "url": safe,
+                    "reason": "time_limit",
+                    "error": "research budget for this lead is spent; save what "
+                             "you have now and do not fetch again",
+                    "budget": budget_state(lead_id)}
+        # A request must never be allowed to outlive the lead's budget. Eighteen
+        # seconds is the ceiling, not the floor.
+        effective_timeout = max(1, int(min(TIMEOUT_S, usable)))
+    else:
+        effective_timeout = TIMEOUT_S
+
     _throttle(_domain_of(safe))
-    acquired = _sem.acquire(timeout=TIMEOUT_S * 2)
+
+    # Waiting for a slot counts against the lead's clock too, so the wait is
+    # bounded by what is left rather than by a multiple of the fetch timeout.
+    wait_budget = effective_timeout if b is None else max(
+        0.5, min(float(effective_timeout), _remaining(b) - SAVE_MARGIN_SECONDS))
+    acquired = _sem.acquire(timeout=wait_budget)
     if not acquired:
+        if b is not None:
+            with _budget_lock:
+                b["failed"] += 1
+            _run_update(lead_id, b)
         _audit(lead_id, safe, "browser", "timeout", None, 0, 0, "concurrency wait")
-        return {"status": "failed", "url": safe, "error": "browser busy; try again"}
+        return {"status": "failed", "url": safe,
+                "error": "browser busy; try again"}
 
     last_err = None
     try:
+        # One retry only when time genuinely allows it. A second attempt that
+        # cannot finish inside the budget is worse than none: it burns the
+        # margin reserved for saving the work.
         for attempt in (1, 2):
+            if b is not None and (_remaining(b) - SAVE_MARGIN_SECONDS) <= 0:
+                last_err = last_err or "budget exhausted before attempt %d" % attempt
+                with _budget_lock:
+                    b["exhausted"] = True
+                break
             try:
                 prov = get_provider()
                 # NOTE: "links" is NOT a valid Steel format value — the API
                 # returns 400. Links and metadata come back alongside markdown
                 # automatically, so request markdown only.
-                data = prov.fetch(safe, ["markdown"])
+                per_call = effective_timeout
+                if b is not None:
+                    per_call = max(1, int(min(
+                        effective_timeout,
+                        _remaining(b) - SAVE_MARGIN_SECONDS)))
+                data = prov.fetch(safe, ["markdown"], timeout=per_call)
                 ms = int((time.time() - started) * 1000)
                 nbytes = len(data.get("markdown") or "")
                 http = (data.get("metadata") or {}).get("status_code")
                 data["status"] = "ok"
                 data["_cached"] = False
+                data["source"] = "steel"
                 _cache_put(lead_id, safe, page_type, prov.name, data, "ok")
                 _audit(lead_id, safe, "browser", "ok", http, ms, nbytes, None)
+                if b is not None:
+                    with _budget_lock:
+                        b["pages"] += 1
+                        b["succeeded"] += 1
+                        b["fetch_seconds"] += (time.time() - started)
+                    _run_update(lead_id, b)
                 return data
             except urllib.error.HTTPError as exc:
                 last_err = "http %s" % exc.code
@@ -337,13 +558,50 @@ def research_fetch(url: str, lead_id: Optional[str] = None,
                     break          # client error: retrying will not help
             except Exception as exc:
                 last_err = "%s: %s" % (type(exc).__name__, exc)
+            # Back off only if there is room to try again afterwards.
+            if b is not None and (_remaining(b) - SAVE_MARGIN_SECONDS) <= 1.5:
+                break
             time.sleep(1.5 * attempt)
     finally:
         _sem.release()
 
     ms = int((time.time() - started) * 1000)
     _audit(lead_id, safe, "browser", "failed", None, ms, 0, last_err)
-    return {"status": "failed", "url": safe, "error": last_err or "unknown"}
+    if b is not None:
+        with _budget_lock:
+            b["pages"] += 1
+            b["failed"] += 1
+            b["fetch_seconds"] += (time.time() - started)
+        _run_update(lead_id, b)
+    return {"status": "failed", "url": safe, "error": last_err or "unknown",
+            "budget": budget_state(lead_id) if lead_id else None}
+
+
+def finalize_research(lead_id: str, observations: int,
+                      status: str = "ok") -> Dict[str, Any]:
+    """Close the run and write down what it cost. Called when NOVA saves."""
+    b = _budget(lead_id)
+    elapsed = _elapsed(b)
+    try:
+        with _db() as con:
+            con.execute(
+                "UPDATE research_runs SET completed_at=datetime('now'),"
+                "  duration_ms=?, observations_count=?, research_status=?,"
+                "  budget_exhausted=?, timed_out=?, pages_attempted=?,"
+                "  pages_succeeded=?, pages_from_cache=?, pages_failed=?,"
+                "  pages_refused=?, fetch_seconds=? WHERE lead_id=?",
+                (int(elapsed * 1000), observations, status,
+                 1 if b["exhausted"] else 0,
+                 1 if elapsed >= HARD_LIMIT_SECONDS else 0,
+                 b["pages"], b["succeeded"], b["cache_hits"], b["failed"],
+                 b["refused"], round(b["fetch_seconds"], 3), lead_id))
+    except Exception:
+        pass
+    with _budget_lock:
+        _budgets.pop(lead_id, None)
+    return {"lead_id": lead_id, "duration_ms": int(elapsed * 1000),
+            "observations": observations, "status": status,
+            "pages": b["pages"], "from_cache": b["cache_hits"]}
 
 
 # ----------------------------------------------------------------------------
@@ -359,8 +617,11 @@ TOOLS = [
             "http/https addresses are allowed; private, loopback and cloud "
             "metadata addresses are refused. Results are cached, so re-reading "
             "an unchanged page is cheap. ALWAYS check the returned `status` "
-            "field — it is one of ok, blocked, or failed — before using any "
-            "content. On blocked or failed, do not invent the page contents."
+            "field — ok, blocked, failed, or budget_exhausted — before using "
+            "any content. On blocked, failed or budget_exhausted, do not "
+            "invent the page contents. Every result carries a `budget` object: "
+            "when `may_fetch` is false you have run out of pages or time, and "
+            "must finalise with the evidence already gathered."
         ),
         "inputSchema": {
             "type": "object",
@@ -382,18 +643,43 @@ TOOLS = [
         "description": "Check whether the browser provider is reachable.",
         "inputSchema": {"type": "object", "properties": {}},
     },
+    {
+        "name": "research_status",
+        "description": (
+            "How much research budget is left for this lead: seconds remaining, "
+            "pages already read, pages still allowed, and the observation "
+            "thresholds you are working to. Call it before deciding whether to "
+            "fetch another page. When `may_fetch` is false, stop and save what "
+            "you have — further fetches will be refused."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"lead_id": {"type": "string"}},
+            "required": ["lead_id"],
+        },
+    },
 ]
 
 
 def _dispatch(name: str, args: Dict[str, Any]) -> str:
     if name == "fetch_page":
+        lead = (args.get("lead_id") or "") or None
         out = research_fetch(
             args.get("url", ""),
-            (args.get("lead_id") or "") or None,
+            lead,
             args.get("page_type") or "other",
             bool(args.get("refresh")),
         )
+        # Attached to every result so the stopping decision is made from
+        # numbers the agent has just been handed, not from its own counting.
+        if lead and "budget" not in out:
+            out["budget"] = budget_state(lead)
         return json.dumps(out, ensure_ascii=False)[:400000]
+    if name == "research_status":
+        lead = (args.get("lead_id") or "").strip()
+        if not lead:
+            return json.dumps({"error": "lead_id is required"})
+        return json.dumps(budget_state(lead))
     if name == "browser_health":
         try:
             return json.dumps(get_provider().health_check())

@@ -154,3 +154,42 @@ Do NOT substitute:
 Memory is not evidence. If you recall researching this business before, you
 must still fetch the pages again this session, because the claim you output
 must be traceable to a retrieval that actually happened in this run.
+
+## STOPPING RULES — read this before your first fetch
+
+You are one of many leads being researched at once. Time you spend is time the
+whole pipeline waits. The budget is enforced by the server, not by you: fetches
+are refused once it is spent, so running long does not get you more evidence,
+it gets you none.
+
+**Every `fetch_page` result carries a `budget` object. Read it.** It tells you
+seconds remaining, pages already read, and pages still allowed. When
+`may_fetch` is false, stop and save immediately.
+
+**Read at most three pages.** In priority order:
+
+1. the homepage
+2. whichever of About or Services looks more substantial
+3. one more, chosen because it will actually tell you something — pricing,
+   contact, a case study. Choose it; do not work through the site.
+
+**Stop as soon as you have enough.** Enough is:
+
+- 3 verified observations — acceptable, save and stop
+- 4 — what to aim for
+- 5 — the maximum; more is not better
+
+If the homepage and one other page already give you 4 solid observations, do
+not fetch a third. Save immediately. A fourth page that adds nothing has cost
+the pipeline several seconds for no gain.
+
+**None of this weakens the evidence rule.** Speed is never a reason to write
+something you did not retrieve. If the budget runs out with fewer than 3
+verified observations, that is a failed research run — say so, with
+`research_status: "failed"` and the reason. It becomes a human decision, which
+is the correct outcome. Inventing a third observation to look finished is the
+one unrecoverable mistake here: it produces an email that says something untrue
+to a real person.
+
+A cached page is real evidence and costs almost nothing — it was fetched and
+verified earlier. Cite it exactly as you would a fresh fetch.
