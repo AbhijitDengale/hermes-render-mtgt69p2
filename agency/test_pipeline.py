@@ -37,8 +37,11 @@ def fresh_db(tmp) -> str:
     # therefore exactly right — but it makes for a confusing test run.
     con.executescript(
         (HERE / "seed_state_transitions.sql").read_text(encoding="utf-8"))
-    con.executescript(
-        (HERE / "migrations" / "001_phase_c_pipeline.sql").read_text(encoding="utf-8"))
+    # Every migration, in order. Pinning a subset meant a fixture could drift
+    # behind the real schema and a suite would fail on a table the running
+    # system has had for weeks.
+    for m in sorted((HERE / "migrations").glob("*.sql")):
+        con.executescript(m.read_text(encoding="utf-8"))
     con.close()
     return path
 

@@ -117,11 +117,59 @@ def due(con: sqlite3.Connection, limit: int = 20) -> List[sqlite3.Row]:
     # Only 'scheduled' is eligible. Once ECHO has handed a stage to the
     # pipeline it becomes 'dispatched' and stops appearing here, so later ticks
     # neither re-evaluate it nor inflate its attempt count.
+    # The campaign's status comes along for the ride so blocked_reason can see
+    # it. A campaign the operator has paused must not keep sending, and until
+    # this join existed nothing anywhere consulted campaigns.status.
     return con.execute(
-        "SELECT f.*, l.state AS lead_state, l.ooo_until, l.email AS lead_email "
-        "  FROM followups f JOIN leads l ON l.id = f.lead_id "
+        "SELECT f.*, l.state AS lead_state, l.ooo_until, l.email AS lead_email,"
+        "       COALESCE(c.status, 'active') AS campaign_status "
+        "  FROM followups f "
+        "  JOIN leads l ON l.id = f.lead_id "
+        "  LEFT JOIN campaigns c ON c.id = f.campaign_id "
         " WHERE f.status='scheduled' AND f.scheduled_for <= datetime('now') "
         " ORDER BY f.scheduled_for LIMIT ?", (limit,)).fetchall()
+
+
+# Only 'active' runs. draft, paused and archived all mean "not now", and a
+# campaign row that has gone missing is treated as active so a bookkeeping
+# gap cannot silently halt live outreach.
+RUNNING = frozenset({"active"})
+
+
+def _campaign_status(row: sqlite3.Row) -> str:
+    try:
+        return row["campaign_status"] or "active"
+    except (IndexError, KeyError):
+        return "active"
+
+
+def is_paused(row: sqlite3.Row) -> bool:
+    """True when the follow-up's campaign is not running.
+
+    Distinguished from every other block because it is REVERSIBLE: the
+    follow-up stays scheduled so resuming the campaign brings it back, and its
+    attempt count is untouched — a paused day is not a failed delivery.
+    """
+    return _campaign_status(row) not in RUNNING
+
+
+def mark_blocked(con: sqlite3.Connection, followup_id: str,
+                 reason: str) -> bool:
+    """Record why a follow-up was held, without consuming it.
+
+    Status stays 'scheduled' and attempts is not incremented, so the follow-up
+    returns the moment the block lifts. Returns True only when the reason is
+    new, so ECHO can write one event per change instead of one every two
+    minutes for as long as the campaign stays paused.
+    """
+    row = con.execute("SELECT last_blocked_reason FROM followups WHERE id=?",
+                      (followup_id,)).fetchone()
+    changed = row is None or (row["last_blocked_reason"] or "") != reason[:200]
+    con.execute(
+        "UPDATE followups SET last_blocked_reason=?,"
+        "       last_blocked_at=datetime('now') WHERE id=?",
+        (reason[:200], followup_id))
+    return changed
 
 
 def blocked_reason(row: sqlite3.Row) -> Optional[str]:
@@ -131,6 +179,11 @@ def blocked_reason(row: sqlite3.Row) -> Optional[str]:
     schedule made three days ago knows nothing about the reply that arrived
     yesterday.
     """
+    # Checked before anything about the lead: if the campaign is not running,
+    # nothing under it should send, whatever the individual lead is doing.
+    if is_paused(row):
+        return ("campaign %s is %s"
+                % (row["campaign_id"], _campaign_status(row)))
     state = row["lead_state"]
     if state in TERMINAL:
         return "lead is %s" % state

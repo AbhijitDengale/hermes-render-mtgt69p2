@@ -208,6 +208,8 @@ def apply_migrations(check: bool) -> None:
                     ).fetchone()),
             "004_followup_lifecycle.sql":
                 lambda: has_column("followups", "dispatched_at"),
+            "005_campaign_pause_and_generation.sql":
+                lambda: has_column("followups", "last_blocked_reason"),
         }
 
         applied = {r[0] for r in con.execute(

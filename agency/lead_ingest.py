@@ -159,6 +159,32 @@ def ensure_campaign(con: sqlite3.Connection, campaign_id: str) -> None:
         (campaign_id, campaign_id))
 
 
+def bump_generation(con: sqlite3.Connection, lead_id: str) -> int:
+    """Advance this lead id's lifecycle counter and return the new value.
+
+    One statement, so two concurrent ingests of the same id cannot both read
+    the same number and hand out a colliding generation.
+    """
+    con.execute(
+        "INSERT INTO lead_generations (lead_id, generation) VALUES (?, 1) "
+        "ON CONFLICT (lead_id) DO UPDATE SET generation = generation + 1,"
+        "                                    updated_at = datetime('now')",
+        (lead_id,))
+    row = con.execute("SELECT generation FROM lead_generations WHERE lead_id=?",
+                      (lead_id,)).fetchone()
+    return int(row[0]) if row else 1
+
+
+def generation_of(con: sqlite3.Connection, lead_id: str) -> int:
+    """The lead's current lifecycle generation; 1 if it predates the counter."""
+    row = con.execute(
+        "SELECT lifecycle_generation FROM leads WHERE id=?", (lead_id,)).fetchone()
+    try:
+        return int(row["lifecycle_generation"]) if row else 1
+    except (IndexError, KeyError, TypeError):
+        return 1
+
+
 def ingest_one(con: sqlite3.Connection, raw: Dict[str, Any],
                source: str = "manual",
                default_campaign: Optional[str] = None) -> Dict[str, Any]:
@@ -194,12 +220,21 @@ def ingest_one(con: sqlite3.Connection, raw: Dict[str, Any],
         # index fired for a caller-supplied id. Both mean: already have them.
         return {"status": "duplicate", "lead_id": lead_id, "email": row["email"]}
 
+    # A fresh row for an id that has lived before starts a new lifecycle. The
+    # counter is kept outside `leads` precisely so deleting the lead does not
+    # reset it — otherwise the re-ingested lead would reuse the previous
+    # lifecycle's Kanban tasks, which are already 'done', and no worker would
+    # ever be spawned for it again.
+    generation = bump_generation(con, lead_id)
+    con.execute("UPDATE leads SET lifecycle_generation=? WHERE id=?",
+                (generation, lead_id))
+
     con.execute(
         "INSERT INTO events (lead_id, campaign_id, agent, event_type,"
         "                    from_state, to_state, detail) "
         "VALUES (?,?,?,?,?,?,?)",
         (lead_id, row["campaign_id"], "ingest", "lead.ingested", None, "NEW",
-         "source=%s" % row["source"]))
+         "source=%s generation=%d" % (row["source"], generation)))
     con.execute(
         "INSERT INTO audit_logs (actor, action, subject_type, subject_id, detail) "
         "VALUES ('ingest','lead.created','lead',?,?)",

@@ -10,14 +10,24 @@ No new features were added in this phase.
 
 > ### CONTROLLED TESTING
 >
-> Not yet low-volume production. Two things block the upgrade, both named in
-> §24, and one of them is a security fix that is written, tested and pushed but
-> **not running**.
+> Three things block the upgrade, all named in §24. One is a security fix that
+> is written, tested and pushed but **still not running**; one is a workflow
+> gap; one is simply a lack of evidence.
 
 The pipeline is complete and every safety mechanism has been verified against
-the live system. What is missing is not capability — it is a deployed fix and a
-volume of real sends large enough to mean anything. Eleven leads and three real
-messages is not evidence about deliverability, reply rate, or spam placement.
+the live system. Both edge cases found by this audit are now fixed and covered
+by tests (§23a). What remains:
+
+1. **MailHub commit `e6d8e21` is not deployed.** Until it is, the `suppress`
+   scope is not enforced (§2).
+2. **Nothing advances `READY_TO_SEND` to `SENT` automatically** — the
+   orchestrator has no cron, so a confirmed send needs a manual tick (§24.9).
+   That is a genuine workflow gap, not just missing evidence.
+3. **Twelve leads and three real messages** say nothing about deliverability,
+   reply rate or spam placement.
+
+BULK PRODUCTION is not appropriate while (2) stands, regardless of how much
+volume is run.
 
 ---
 
@@ -404,13 +414,22 @@ authoritative in every case.
 | `test_regressions.py` | 29 passed, 0 failed |
 | `test_orbit_review.py` | 80 passed, 0 failed |
 | `test_v1_regressions.py` | 29 passed, 0 failed |
+| `test_edge_cases.py` | 37 passed, 0 failed |
 | `test_scenarios.py` (legacy, on the box) | 34 passed, 0 failed |
 | MailHub `test_web.py` | 121 passed, 0 failed |
 | MailHub `test_sender.py` | 25 passed, 0 failed |
-| **Automated total** | **453 passed, 0 failed** |
+| **Automated total** | **490 passed, 0 failed** |
 | Phase F live (on the box) | 30 passed, 0 failed |
 | Integrated scenario (on the box) | 22 passed, 0 failed |
-| **Grand total** | **505 passed, 0 failed** |
+| **Grand total** | **542 passed, 0 failed** |
+
+`test_v1_regressions.py` and `test_edge_cases.py` were also run **on the box**
+against the deployed code, not only locally: 29 and 37, both clean.
+
+Three suites had pinned a subset of migrations when building their fixture
+(`001` only, or a hard-coded pair). That let a fixture drift behind the real
+schema, and it is why they broke the moment ingestion started using a table
+migration 005 adds. They now apply every migration in order.
 
 ### The twenty regressions, each pinned by name
 
@@ -441,7 +460,115 @@ Every one was a real failure on a running system.
 
 ## 23. Final controlled end-to-end
 
-*(see §23 result below)*
+One lead, real agents, no stage skipped or simulated. Recipient is the
+operator's own mailbox.
+
+| | |
+|---|---|
+| Lead | `L-617a6cecc3a4d6fd` — Plausible Analytics, `https://plausible.io` |
+| Campaign | `C-V1-FINAL` |
+| Recipient | the operator's own address (plus-addressed, so it is distinguishable) |
+
+```
+11:19:18  ingest                            NEW                 source=manual, generation 1
+11:19:46  MAYA                NEW        -> RESEARCH_PENDING     admitted
+11:19:47  MAYA   RESEARCH_PENDING        -> RESEARCHING          task t_d30352bd -> NOVA
+11:20:40  NOVA        RESEARCHING        -> RESEARCH_COMPLETE    6 observations, each with a source_url
+11:20:40  MAYA   RESEARCH_COMPLETE       -> COPY_PENDING         ready for copy
+11:21:36  ARIA        COPY_PENDING       -> COPY_READY           draft M-L-617a6cecc3a4d6fd-0
+11:21:36  MAYA          COPY_READY       -> QA_PENDING           sent for QA
+11:22:31  SENTINEL      QA_PENDING       -> READY_TO_SEND        approval 7
+11:26     MAYA        READY_TO_SEND         queued as MailHub #20
+```
+
+Every component was exercised: Kanban dispatch, Steel research, the evidence
+protocol, ARIA's copy, SENTINEL's content-bound approval, and MailHub's queue
+with a content-derived idempotency key.
+
+**Current state: queued, awaiting warmup capacity.** MailHub #20 is `pending`
+with `approval_id: 7`. The mailbox is at **5/5** and `sent_today` resets when
+the calendar date rolls over in Postgres (UTC), roughly twelve hours after this
+audit. The cap was **not** raised. The provider handoff itself is not
+unproven — it has succeeded twice before with real provider ids
+(`1a05bfa243ee938a`, `1a05c213cc68445b`).
+
+### What the two failed attempts taught us
+
+Neither was wasted, and both are worth recording because both looked like
+system failures and only one was.
+
+**Attempt 1** targeted `cadenceworks.com`, which Steel returns `HTTP 500` for
+while scraping other sites happily. NOVA hit the 500 and **refused to write
+anything from prior knowledge**, escalating to `HUMAN_REVIEW` with
+`research failed: http 500`. That is the evidence protocol in NOVA's SOUL
+working exactly as intended: a well-known fact about a business is still a
+fabrication if it was not retrieved this session.
+
+**Attempt 2** exposed a real defect — the Kanban idempotency collision now
+fixed in §23a below. The lead had been deleted and re-ingested, drew the same
+deterministic id, and matched the *completed* task from its first life. Kanban
+returned that task, no worker spawned, and the lead sat in `RESEARCHING`
+indefinitely.
+
+A third observation, benign: ARIA wrote drafts for stages 0 **and** 1–3 in one
+session rather than only the one asked for. Those follow-up drafts carry
+`qa_status = NULL`, so the gate still blocks them — `queue_and_send` routes any
+unapproved draft to `HUMAN_REVIEW` rather than sending it. Untidy, not unsafe.
+
+## 23a. The two edge cases, fixed
+
+Both were found by this audit and both are now closed, with migration 005 and
+`test_edge_cases.py` (37 checks).
+
+### A — a paused campaign now actually stops ECHO
+
+`due()` and `blocked_reason()` never consulted `campaigns.status`, so marking a
+campaign paused documented an intention and changed nothing.
+
+`due()` now carries the campaign's status alongside the lead's state, and
+`blocked_reason()` checks it **first**: if the campaign is not running, nothing
+under it sends, whatever the individual lead is doing. `draft`, `paused` and
+`archived` all count as not running; only `active` runs. A follow-up whose
+campaign row is missing is treated as **active**, so a bookkeeping gap cannot
+silently halt live outreach.
+
+The important part is that a pause is *reversible*. A blocked follow-up is
+**held, not skipped**:
+
+- status stays `scheduled`, so resuming the campaign brings it straight back
+- `attempts` is **not** incremented — a paused day is not a failed delivery
+- the reason and timestamp are written to `followups.last_blocked_reason` /
+  `last_blocked_at`
+- an event is written only when the reason **changes**, not on every tick.
+  ECHO runs every two minutes; one event per tick per held follow-up would
+  bury the real history within a day.
+
+Verified: eleven consecutive ticks against a paused campaign produced one
+event, zero attempts, and no state change; reactivating the campaign made ECHO
+dispatch it on the next tick.
+
+### B — a re-ingested lead gets a fresh task generation
+
+Idempotency keys were `agency:<lead_id>:<stage>`, and lead ids are
+deterministic. The fix adds a lifecycle counter to the key:
+
+```
+agency:<lead_id>:gen:<generation>:<stage>
+```
+
+The counter deliberately lives in its own table, `lead_generations`, which is
+**not** foreign-keyed to `leads` and is never cascaded — it is the memory of
+how many lives an id has had. Putting it only on the lead row would have reset
+it to 1 on deletion and brought the collision straight back. Migration 005
+backfills every existing lead, so nothing already in the system starts a second
+life at generation 1.
+
+The global protection is untouched: within one lifecycle the key is unchanged,
+so retries, restarts and concurrent ticks still collapse onto a single task.
+Verified — five retries in one lifecycle produced one key; six concurrent
+bumps produced six distinct generations; and the generation-1 and generation-2
+keys are identical apart from the generation, which is precisely why the old
+completed task can no longer answer for the new lifecycle.
 
 ## 24. Known limitations
 
@@ -465,22 +592,23 @@ Every one was a real failure on a running system.
    its own. If NOVA research fails in bursts, check this before the API key.
 8. **No automated deploy verification.** Nothing currently notices that a push
    did not become a deploy — which is exactly how limitation 1 went unnoticed.
-9. **A paused campaign still sends.** `due()` and `blocked_reason()` never
-   consult `campaigns.status`, so setting a campaign to `paused` documents
-   intent but stops nothing. The working levers are pausing the ECHO cron job
-   or disabling the mailbox in MailHub (§27). Found during this audit; not
-   changed, because changing scheduling behaviour is not what this phase is
-   for.
-10. **Re-ingesting a deleted lead cannot be re-researched.** Kanban
-    idempotency keys are `agency:<lead_id>:<stage>` and lead ids are
-    deterministic (`sha256(campaign‖email)`). Delete a lead and re-ingest it
-    and the key matches the *completed* task from the first run, so Kanban
-    returns that task, no worker spawns, and the lead sits in `RESEARCHING`
-    forever. This only bites on delete-and-re-ingest, which is a test
-    operation — in normal use the key is exactly right, and is what stops a
-    retick or a restart spawning a second worker on the same lead. Workaround:
-    use a different address, or clear the stale task.
+9. **Nothing advances `READY_TO_SEND` to `SENT` on its own.** The orchestrator
+   has no cron job, so after MailHub confirms a send somebody must run
+   `orchestrator.py tick` for the lead to pick up the provider id and move on.
+   ECHO, review alerts and ORBIT are scheduled; the pipeline itself is not.
+   Deliberately not changed here — installing a job that autonomously drives
+   the whole pipeline is not a change to make silently during a release
+   freeze, and it would advance the other in-flight leads too. **This is the
+   one gap that keeps the classification below LOW-VOLUME PRODUCTION on
+   workflow grounds rather than evidence grounds.**
+10. **ARIA writes unrequested follow-up drafts.** In the final E2E she produced
+    stages 1–3 alongside stage 0. They carry no QA verdict and cannot be sent,
+    so this is clutter rather than risk.
 11. **Credential rotation is out of scope** for this phase, as instructed.
+
+Items 9 and 10 of the previous revision — a paused campaign that still sent,
+and a re-ingested lead that could never be researched — are **fixed**; see
+§23a.
 
 ---
 
@@ -557,6 +685,23 @@ Then act on one — each is audited and none of them sends anything by itself:
 
 An `edit` is saved as a **new** draft with no QA verdict — SENTINEL must approve
 your words before they can be queued.
+
+### 29a. How to advance a confirmed send
+
+Nothing does this on a schedule (§24.9). After MailHub confirms a send, run a
+tick so the lead picks up the provider id and moves on:
+
+```bash
+cd /opt/data/agency && set -a && . /opt/data/.env && set +a && python3 orchestrator.py tick
+```
+
+Use MAYA's own credential, as above — the review CLI's key is `read,suppress`
+and will be refused at the queue with a 403.
+
+```bash
+cd /opt/data/agency && python3 orchestrator.py status
+cd /opt/data/agency && python3 orchestrator.py timeline <lead-id>
+```
 
 ### 30. How to inspect cron
 
@@ -659,6 +804,13 @@ and nothing else.
 
 ## Sign-off
 
-**CONTROLLED TESTING.** Deploy `e6d8e21`, then run enough real volume to say
-anything about deliverability. Bulk outreach is not enabled and should not be
-until both are done.
+**CONTROLLED TESTING.**
+
+To reach **LOW-VOLUME PRODUCTION**: deploy `e6d8e21` and verify the suppression
+matrix, then decide how `READY_TO_SEND` should advance — either an orchestrator
+cron or a documented manual step someone actually performs.
+
+To reach **BULK PRODUCTION**: the above, plus enough real volume to say
+something honest about deliverability, plus more than one warmed mailbox.
+
+Bulk outreach is not enabled, and nothing in this phase enabled it.

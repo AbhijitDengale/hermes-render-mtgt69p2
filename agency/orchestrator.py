@@ -65,14 +65,26 @@ def mailhub(method: str, path: str,
 
 # --- Kanban -----------------------------------------------------------------
 
+def gen(lead) -> int:
+    """This lead's lifecycle generation, or 1 if it predates the counter."""
+    try:
+        return int(lead["lifecycle_generation"] or 1)
+    except (IndexError, KeyError, TypeError):
+        return 1
+
+
 def dispatch(lead_id: str, profile: str, title: str, body: str,
-             stage_key: str) -> Dict[str, Any]:
+             stage_key: str, generation: int = 1) -> Dict[str, Any]:
     """Create the task, or return the existing one.
 
-    The idempotency key is (lead, stage), so a tick that runs twice — or a
-    restart mid-stage — does not spawn a second worker on the same lead.
+    The idempotency key is (lead, lifecycle generation, stage). Within one
+    lifecycle a tick that runs twice — or a restart mid-stage — collapses onto
+    the same task, which is the protection worth keeping. Across lifecycles it
+    does not: a lead that was deleted and re-ingested used to match the
+    COMPLETED task from its previous life, so Kanban handed that task back,
+    no worker was spawned, and the lead sat in RESEARCHING forever.
     """
-    key = "agency:%s:%s" % (lead_id, stage_key)
+    key = "agency:%s:gen:%d:%s" % (lead_id, generation, stage_key)
     cmd = [HERMES, "kanban", "create", title, "--assignee", profile,
            "--body", body, "--idempotency-key", key, "--json"]
     env = {**os.environ, "HOME": os.getenv("HERMES_HOME", "/opt/data"),
@@ -114,7 +126,7 @@ def dispatch_research(con, lead) -> str:
               "must carry a source_url and a quoted evidence string. If you "
               "cannot fetch anything, report research_status 'failed' — never "
               "write findings you did not fetch this session."),
-        "research")
+        "research", gen(lead))
     with P.writing(con):
         P.transition(con, lead["id"], "RESEARCHING", AGENT,
                      "dispatched to NOVA", expect="RESEARCH_PENDING",
@@ -188,7 +200,7 @@ def dispatch_copy(con, lead) -> Optional[str]:
                    "claim must cite a source_url that appears in NOVA's "
                    "research — you have no browser and may not add facts."
                    + issues),
-             "copy:%d" % attempt)
+             "copy:%d" % attempt, gen(lead))
     return None
 
 
@@ -228,7 +240,7 @@ def dispatch_qa(con, lead) -> Optional[str]:
                    "any claim not supported by a cited observation, any "
                    "invented metric, any guarantee, and any unresolved "
                    "placeholder."),
-             "qa:%d" % attempt)
+             "qa:%d" % attempt, gen(lead))
     return None
 
 
@@ -386,7 +398,7 @@ def followup_copy(con, lead) -> Optional[str]:
                    "save_draft — omitting it would overwrite the original "
                    "email." % (stage, stage, stage)
                    + context),
-             "followup:%d:r%d" % (stage, retries))
+             "followup:%d:r%d" % (stage, retries), gen(lead))
     return None
 
 

@@ -33,6 +33,22 @@ def tick(limit: int = 20) -> list:
 
             # Live state, read now — not what was true when this was scheduled.
             reason = F.blocked_reason(row)
+            if reason and F.is_paused(row):
+                # Reversible: the campaign is simply not running today. The
+                # follow-up stays scheduled and its attempt count is untouched,
+                # so resuming the campaign brings it straight back. One event
+                # per change of reason, not one per tick.
+                with P.writing(con):
+                    if F.mark_blocked(con, fid, reason):
+                        con.execute(
+                            "INSERT INTO events (lead_id, campaign_id, agent,"
+                            "  event_type, detail) VALUES (?,?,?,?,?)",
+                            (lead_id, row["campaign_id"], "echo",
+                             "followup.blocked",
+                             "stage %d held: %s" % (stage, reason)))
+                        out.append("hold %s stage %d: %s"
+                                   % (lead_id, stage, reason))
+                continue
             if reason:
                 with P.writing(con):
                     F.mark_skipped(con, fid, reason)
