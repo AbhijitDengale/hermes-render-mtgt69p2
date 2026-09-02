@@ -242,6 +242,40 @@ def collect(db: str = None) -> Dict[str, Any]:
     except Exception as exc:
         m["research_error"] = "%s: %s" % (type(exc).__name__, exc)
 
+    # --- capacity across every tenant --------------------------------------
+    # ORBIT holds a read-only key for one tenant, so /api/v1/accounts shows it
+    # one mailbox out of five. tenant_health is where each tenant's own profile
+    # records what MailHub told it, which is the only complete picture any
+    # single process can see without holding every tenant's credential.
+    m["tenants"] = []
+    try:
+        with P.connect(db) as tcon:
+            rows = tcon.execute(
+                "SELECT tenant_name, user_id, mailbox_email, health, daily_limit,"
+                "       sent_today, mailbox_ok, queue_ok, approve_ok, leo_ok,"
+                "       mailbox_checked_at"
+                "  FROM tenant_health ORDER BY tenant_name").fetchall()
+    except Exception:
+        rows = []
+    for r in rows:
+        d = dict(r)
+        limit = d.get("daily_limit") or 0
+        sent = d.get("sent_today") or 0
+        ready = all(d.get(c) for c in ("mailbox_ok", "queue_ok", "approve_ok",
+                                       "leo_ok"))
+        d["ready"] = ready
+        d["remaining"] = max(0, limit - sent)
+        m["tenants"].append(d)
+
+    m["capacity_configured"] = sum(t.get("daily_limit") or 0
+                                   for t in m["tenants"] if t.get("mailbox_ok"))
+    # Usable is what could actually be sent right now: a tenant missing any
+    # credential cannot carry a lead end to end, so its mailbox is capacity on
+    # paper only and is excluded rather than quietly counted.
+    m["capacity_usable"] = sum(t["remaining"] for t in m["tenants"]
+                               if t.get("ready"))
+    m["tenants_ready"] = sum(1 for t in m["tenants"] if t.get("ready"))
+
     # --- sender health, from MailHub only ----------------------------------
     accounts = mailhub("/api/v1/accounts")
     m["senders"] = []
@@ -409,14 +443,46 @@ def report(m: Dict[str, Any]) -> str:
         active = [a for a in senders if a.get("enabled")]
         warming = [a for a in senders if a.get("health") == "warming"]
         paused = [a for a in senders if not a.get("enabled")]
-        sent_today = sum(a.get("sent_today") or 0 for a in senders)
-        cap = sum(a.get("effective_daily_limit") or 0 for a in senders)
+        # Only enabled mailboxes: a paused one cannot be selected, so counting
+        # its limit would report capacity that does not exist.
+        sent_today = sum(a.get("sent_today") or 0 for a in active)
+        cap = sum(a.get("effective_daily_limit") or 0 for a in active)
         L.append("  Mailboxes active:           %d of %d" % (len(active), len(senders)))
         L.append("  Sent today:                 %d" % sent_today)
         L.append("  Capacity today:             %d" % cap)
         L.append("  Remaining safe capacity:    %d" % max(0, cap - sent_today))
         L.append("  Warming:                    %d" % len(warming))
         L.append("  Paused / blocked:           %d" % len(paused))
+        for a in active:
+            lim = a.get("effective_daily_limit") or 0
+            L.append("    %-30s %-9s %3d/%-3d  %d left"
+                     % (a.get("email"), a.get("health"),
+                        a.get("sent_today") or 0, lim,
+                        max(0, lim - (a.get("sent_today") or 0))))
+        for a in paused:
+            L.append("    %-30s paused    excluded from capacity"
+                     % a.get("email"))
+
+    ts = m.get("tenants") or []
+    if ts:
+        L.append("")
+        L.append("  Sender tenants:             %d ready of %d"
+                 % (m.get("tenants_ready") or 0, len(ts)))
+        for t in ts:
+            missing = [n for n, c in (("queue", "queue_ok"),
+                                      ("approve", "approve_ok"),
+                                      ("leo", "leo_ok"),
+                                      ("mailbox", "mailbox_ok"))
+                       if not t.get(c)]
+            L.append("    %-30s %-9s %3s/%-3s  %s"
+                     % (t.get("mailbox_email") or t.get("tenant_name"),
+                        t.get("health") or "-",
+                        t.get("sent_today") if t.get("sent_today") is not None else "-",
+                        t.get("daily_limit") if t.get("daily_limit") is not None else "-",
+                        "ready" if t.get("ready")
+                        else "NOT ready (missing: %s)" % ", ".join(missing)))
+        L.append("  Total configured capacity:  %d/day" % (m.get("capacity_configured") or 0))
+        L.append("  Currently usable capacity:  %d/day" % (m.get("capacity_usable") or 0))
     L.append("")
 
     # ---- PIPELINE --------------------------------------------------------

@@ -39,7 +39,8 @@ from typing import Any, Dict, List, Optional
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import followups as F  # noqa: E402
-import pipeline as P   # noqa: E402
+import pipeline as P
+import tenants   # noqa: E402
 
 MAILHUB_BASE = os.getenv("MAILHUB_BASE_URL", "").rstrip("/")
 MAILHUB_TOKEN = os.getenv("MAILHUB_API_TOKEN", "")
@@ -48,13 +49,22 @@ AGENT = "maya"
 
 
 def mailhub(method: str, path: str,
-            body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    if not MAILHUB_BASE or not MAILHUB_TOKEN:
+            body: Optional[Dict[str, Any]] = None,
+            token: Optional[str] = None) -> Dict[str, Any]:
+    """One MailHub call as one tenant.
+
+    /api/v1/inbound only ever returns replies belonging to the calling key's
+    own mailboxes, so the token decides which inbox is being read. Reading
+    with the wrong one is not an error -- it is an empty result, which looks
+    exactly like nobody having replied.
+    """
+    tok = token or MAILHUB_TOKEN
+    if not MAILHUB_BASE or not tok:
         return {"error": "MailHub not configured"}
     req = urllib.request.Request(
         MAILHUB_BASE + path, method=method,
         data=json.dumps(body).encode() if body is not None else None)
-    req.add_header("Authorization", "Bearer " + MAILHUB_TOKEN)
+    req.add_header("Authorization", "Bearer " + tok)
     req.add_header("Content-Type", "application/json")
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
@@ -96,11 +106,13 @@ def record(con, ev: Dict[str, Any]) -> Optional[int]:
     """
     cur = con.execute(
         "INSERT OR IGNORE INTO inbound_replies "
-        " (provider_message_id, provider_thread_id, mailhub_inbound_id, lead_id,"
+        " (tenant_user_id, provider_message_id, provider_thread_id,"
+        "  mailhub_inbound_id, lead_id,"
         "  campaign_id, account_id, from_email, to_email, subject, body_text,"
         "  received_at, matched_by, is_bounce, is_auto_reply) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (ev.get("provider_message_id"), ev.get("provider_thread_id"),
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (ev.get("tenant_user_id"),
+         ev.get("provider_message_id"), ev.get("provider_thread_id"),
          ev.get("inbound_id"), ev.get("lead_id"), ev.get("campaign_id"),
          ev.get("account_id"), ev.get("from"), ev.get("to_email"),
          ev.get("subject"), ev.get("body_text"), ev.get("received_at"),
@@ -108,8 +120,14 @@ def record(con, ev: Dict[str, Any]) -> Optional[int]:
          1 if ev.get("is_auto_reply") else 0))
     if cur.rowcount == 0:
         return None
-    row = con.execute("SELECT id FROM inbound_replies WHERE provider_message_id=?",
-                      (ev.get("provider_message_id"),)).fetchone()
+    # Scoped by tenant as well as id: two tenants may legitimately report the
+    # same provider_message_id, and matching on the id alone would return the
+    # other tenant's row.
+    row = con.execute(
+        "SELECT id FROM inbound_replies"
+        " WHERE provider_message_id=?"
+        "   AND COALESCE(tenant_user_id,-1)=COALESCE(?,-1)",
+        (ev.get("provider_message_id"), ev.get("tenant_user_id"))).fetchone()
     return row["id"] if row else None
 
 
@@ -161,25 +179,53 @@ def process_one(con, ev: Dict[str, Any]) -> str:
 
     # Consume it in MailHub so the same reply is not offered again.
     if ev.get("inbound_id"):
-        mailhub("POST", "/api/v1/inbound/%s/consume" % ev["inbound_id"])
+        mailhub("POST", "/api/v1/inbound/%s/consume" % ev["inbound_id"],
+                token=ev.get("_token"))
 
     return ("reply %d lead=%s cancelled=%d -> %s leo=%s"
             % (reply_id, lead_id, n, moved, task or "not dispatched"))
 
 
 def poll(limit: int = 25) -> List[str]:
-    res = mailhub("GET", "/api/v1/inbound?limit=%d" % limit)
-    if res.get("error"):
-        return ["MailHub: %s" % res]
-    out = []
+    """Read every configured tenant's inbox in turn.
+
+    Every tenant is polled, not only the ready ones: a tenant that has stopped
+    being routable may still be holding a reply to outreach it already sent,
+    and an unread unsubscribe is worse than an unroutable tenant.
+
+    One tenant failing does not stop the others. A tenant whose credential is
+    refused is reported rather than skipped silently, because silence here is
+    indistinguishable from an empty inbox.
+    """
+    out: List[str] = []
+    pool = tenants.load()
+    if not pool:
+        return ["no MailHub tenant configured"]
+
     with P.connect() as con:
-        for ev in res.get("messages", []):
-            try:
-                out.append(process_one(con, ev))
-            except Exception as exc:
-                out.append("error on %s: %s: %s"
-                           % (ev.get("provider_message_id"),
-                              type(exc).__name__, exc))
+        for t in pool:
+            tok = t.get("leo") or t.get("queue")
+            if not tok:
+                out.append("tenant %s: no read credential, inbox not polled"
+                           % t["name"])
+                continue
+            res = mailhub("GET", "/api/v1/inbound?limit=%d" % limit, token=tok)
+            if res.get("error"):
+                out.append("tenant %s: MailHub %s" % (t["name"], res))
+                continue
+            for ev in res.get("messages", []):
+                # Stamped from the credential that fetched it, not from
+                # anything in the payload, so a reply cannot claim to belong
+                # to a tenant it did not arrive in.
+                ev = dict(ev)
+                ev["tenant_user_id"] = t["user_id"]
+                ev["_token"] = tok
+                try:
+                    out.append("[%s] %s" % (t["name"], process_one(con, ev)))
+                except Exception as exc:
+                    out.append("[%s] error on %s: %s: %s"
+                               % (t["name"], ev.get("provider_message_id"),
+                                  type(exc).__name__, exc))
     return out
 
 

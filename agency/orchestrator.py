@@ -294,15 +294,30 @@ def queue_and_send(con, lead) -> Optional[str]:
     key = "lead:%s:%s:stage%d:%s" % (lead["id"], lead["campaign_id"],
                                      stage, draft["content_hash"][:16])
 
-    # The tenant owning this lead's sender mailbox. SENTINEL filed the approval
-    # under the same tenant, because both derive it from the lead id.
-    tok = tenants.queue_token(lead["id"])
+    # The tenant SENTINEL filed the approval under, read back rather than
+    # recomputed. MailHub matches an approval on (owner_user_id, content_hash),
+    # so queueing through any other tenant presents an approval that does not
+    # exist there and the message would be refused.
+    route = tenants.for_message(draft["tenant_user_id"], lead["id"], con)
+    if route["status"] != "persisted":
+        detail = {
+            "changed": "assigned MailHub tenant (user %s) is no longer usable; "
+                       "needs a fresh approval" % route.get("was"),
+            "assigned": "reached READY_TO_SEND without a tenant recorded at "
+                        "approval time",
+            "none": "no usable MailHub tenant configured",
+        }[route["status"]]
+        with P.writing(con):
+            P.transition(con, lead["id"], "HUMAN_REVIEW", AGENT, detail,
+                         expect="READY_TO_SEND")
+        return "READY_TO_SEND -> HUMAN_REVIEW (%s)" % route["status"]
+    tok = route["tenant"]["queue"]
     if not tok:
         with P.writing(con):
             P.transition(con, lead["id"], "HUMAN_REVIEW", AGENT,
-                         "no MailHub tenant credential configured",
+                         "no queue credential for the assigned MailHub tenant",
                          expect="READY_TO_SEND")
-        return "READY_TO_SEND -> HUMAN_REVIEW (no tenant credential)"
+        return "READY_TO_SEND -> HUMAN_REVIEW (no queue credential)"
 
     if not draft["mailhub_queue_id"]:
         res = mailhub("POST", "/api/v1/messages", {

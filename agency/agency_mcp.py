@@ -244,11 +244,21 @@ def t_submit_verdict(a: Dict[str, Any]) -> Dict[str, Any]:
         # Approve inside the tenant that will send this lead. An approval is
         # matched on (owner_user_id, content_hash), so one filed anywhere else
         # simply is not found and the message stalls unsent.
-        approve_tok = tenants.approve_token(lead_id)
-        if not approve_tok:
+        #
+        # The tenant is written to the message row here and read back at queue
+        # time, so a lead cannot drift to a different tenant between the two.
+        pinned = draft["tenant_user_id"] if "tenant_user_id" in draft.keys() else None
+        route = tenants.for_message(pinned, lead_id, con)
+        if route["status"] == "changed":
+            return {"error": "the MailHub tenant this lead was assigned to "
+                             "(user %s) is no longer usable; it needs a fresh "
+                             "approval on a healthy tenant" % route.get("was")}
+        tenant = route["tenant"]
+        if tenant is None or not tenant.get("approve"):
             return {"error": "no approve credential for this lead's MailHub "
                              "tenant; refusing to approve rather than file it "
                              "where the send path will not look"}
+        approve_tok = tenant["approve"]
         res = _mailhub("/api/v1/approvals", {
             "subject": draft["subject"], "body_text": draft["body"],
             "qa_status": "approved", "qa_agent": "sentinel",
@@ -260,6 +270,10 @@ def t_submit_verdict(a: Dict[str, Any]) -> Dict[str, Any]:
         with P.writing(con):
             P.record_qa(con, lead_id, stage, "approved", issues,
                         approval_id=str(res.get("id")))
+            # Written in the same transaction as the verdict: an approval that
+            # exists without the tenant it was filed under would be unusable.
+            con.execute("UPDATE messages SET tenant_user_id=? WHERE id=?",
+                        (tenant["user_id"], draft["id"]))
     return {"recorded": "approved", "lead_id": lead_id,
             "approval_id": res.get("id"), "content_hash": res.get("content_hash")}
 
@@ -402,11 +416,25 @@ def t_submit_classification(a: Dict[str, Any]) -> Dict[str, Any]:
             # Suppression is per tenant in MailHub, so an opt-out has to be
             # recorded in the tenant that would otherwise send the next
             # follow-up -- filing it elsewhere leaves this person mailable.
-            suppressed = _mailhub("/api/v1/suppression",
-                                  {"email": r["from_email"],
-                                   "reason": "unsubscribed",
-                                   "detail": "LEO reply %d" % reply_id},
-                                  token=tenants.queue_token(lead_id))
+            #
+            # The tenant comes from the reply itself rather than from routing:
+            # this is the mailbox the person actually wrote to, and it is the
+            # one whose queue their next follow-up would come from.
+            rt = r["tenant_user_id"] if "tenant_user_id" in r.keys() else None
+            tenant = tenants.by_user_id(rt) if rt is not None else None
+            # LEO holds a read+suppress credential and no queue key, so this
+            # asks for the LEO token specifically rather than any token that
+            # happens to carry the suppress scope.
+            sup_tok = (tenant or {}).get("leo")
+            if not sup_tok:
+                suppressed = {"error": "no LEO suppress credential for the "
+                                       "tenant this reply arrived in"}
+            else:
+                suppressed = _mailhub("/api/v1/suppression",
+                                      {"email": r["from_email"],
+                                       "reason": "unsubscribed",
+                                       "detail": "LEO reply %d" % reply_id},
+                                      token=sup_tok)
 
         if requires_human:
             with P.writing(con):

@@ -132,7 +132,10 @@ def main():
     d = tenants.describe()
     check("no key material in the summary",
           "q-token" not in d and "a-token" not in d, d)
-    check("  but it does say which tenant cannot approve", "approve=NO" in d)
+    # describe() lists the capabilities each tenant actually holds, so a
+    # tenant missing its approve key shows "holds=q" rather than "holds=qa".
+    check("  but it does say which tenant cannot approve",
+          "t1(user=None,holds=qa" in d and "t2(user=None,holds=q," in d, d)
 
     print()
     print("=" * 62)
