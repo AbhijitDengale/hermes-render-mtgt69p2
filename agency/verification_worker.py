@@ -1,0 +1,320 @@
+"""Drive email verification over the Supabase lead table.
+
+Reads leads that need a verdict, verifies them in batches, and writes the
+result back. No model is involved at any point.
+
+Where the evidence goes, and why it goes there: the leads table already has
+`email_verification_status` (text) and `email_verified` (boolean), so those
+carry the verdict. Everything else the verifier returns -- score, reason,
+flags, did_you_mean, mx_host, attempt bookkeeping -- is written into the
+existing `raw_data` jsonb under a single `email_verification` key. That avoids
+inventing eleven columns in a table this code does not own, and keeps one
+self-describing record per lead rather than a scatter of nullable fields.
+
+The admission gate is enforced at claim time as well as here (see
+`claimable_filter`), so a lead whose address changed after it was verified
+cannot be claimed on the strength of the old verdict even before this worker
+has noticed the change.
+"""
+from __future__ import annotations
+
+import datetime
+import json
+from typing import Any, Dict, List, Optional, Tuple
+
+import email_verifier as EV
+import supabase_sync as S
+
+RAW_KEY = "email_verification"
+
+# Lead statuses this worker refuses to touch. A lead that has been rejected,
+# unsubscribed or archived does not become interesting again because its
+# address might resolve.
+SKIP_LEAD_STATUS = {"rejected", "unsubscribed", "do_not_contact", "archived",
+                    "duplicate", "completed", "closed"}
+
+# Verification statuses that still want work. `valid` and `invalid` are final
+# for the address they were recorded against, so they are not re-fetched every
+# two minutes -- the verifier's own cache is 7 days, but the cheapest call is
+# the one never made.
+NEEDS_WORK = {None, "", "pending", "unknown", "retry", "error"}
+
+
+def _now() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _iso(dt: datetime.datetime) -> str:
+    return dt.replace(microsecond=0).isoformat()
+
+
+def record_of(lead: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    raw = lead.get("raw_data")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            raw = None
+    if not isinstance(raw, dict):
+        return None
+    rec = raw.get(RAW_KEY)
+    return rec if isinstance(rec, dict) else None
+
+
+def due_for_verification(lead: Dict[str, Any],
+                         now: Optional[datetime.datetime] = None) -> bool:
+    """Whether this lead should be sent to the verifier on this tick."""
+    now = now or _now()
+    email = EV.normalise(lead.get("email"))
+    if not email or "@" not in email:
+        # No address to check. Handled separately so it is rejected rather
+        # than retried forever against a verifier that will always say the
+        # same thing.
+        return False
+    if not lead.get("is_active", True):
+        return False
+    if (lead.get("status") or "").strip().lower() in SKIP_LEAD_STATUS:
+        return False
+
+    rec = record_of(lead)
+    if EV.stale(rec, email):
+        # Either never verified, or verified against a different address.
+        return True
+    if EV.is_final(rec):
+        return False
+
+    # unknown / risky: honour the backoff the last attempt asked for.
+    nxt = rec.get("next_retry_at") if rec else None
+    if not nxt:
+        return True
+    try:
+        when = datetime.datetime.fromisoformat(str(nxt))
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=datetime.timezone.utc)
+    except Exception:
+        return True
+    return now >= when
+
+
+def fetch_candidates(limit: int = 200) -> List[Dict[str, Any]]:
+    """Leads that plausibly need verification, narrowed further in Python.
+
+    PostgREST cannot express "the stored verdict was for a different address"
+    across two columns, so the coarse filter runs in the database and the exact
+    one runs here. The coarse filter is deliberately generous: missing a lead
+    costs a delay, and the fine filter is cheap.
+    """
+    cols = ("id,email,status,is_active,hermes_status,email_verification_status,"
+            "email_verified,raw_data,updated_at")
+    q = ("leads?select=%s&is_active=eq.true&email=not.is.null"
+         "&order=updated_at.asc&limit=%d" % (cols, limit))
+    rows = S._call(q) or []
+    return [r for r in rows if isinstance(r, dict)]
+
+
+def _patch(lead_id: str, fields: Dict[str, Any]) -> None:
+    S._call("leads?id=eq." + str(lead_id), "PATCH", fields,
+            prefer="return=minimal")
+
+
+def _merged_raw(lead: Dict[str, Any], record: Dict[str, Any]) -> Dict[str, Any]:
+    raw = lead.get("raw_data")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    raw = dict(raw)
+    raw[RAW_KEY] = record
+    return raw
+
+
+def apply_result(lead: Dict[str, Any], result: Dict[str, Any],
+                 now: Optional[datetime.datetime] = None) -> Dict[str, Any]:
+    """Turn one verifier result into the columns to write. Pure; no I/O.
+
+    Returns {"fields": {...}, "decision": ..., "record": {...}} so the caller
+    can decide whether to write and the tests can assert on the mapping without
+    a network or a database.
+    """
+    now = now or _now()
+    prev = record_of(lead) or {}
+    prev_attempts = int(prev.get("attempts") or 0)
+    # A verdict for a different address does not carry its attempt count with
+    # it: the new address deserves a full retry ladder of its own.
+    attempts = 1 if EV.stale(prev, result["email"]) else prev_attempts + 1
+
+    record = EV.verification_record(result, attempts, _iso(now))
+    decision = record["decision"]
+
+    fields: Dict[str, Any] = {
+        "email_verification_status": record["status"],
+        "email_verified": record["status"] == "valid",
+    }
+
+    if decision == "eligible":
+        # Deliberately does NOT touch `status` or `hermes_status`: a valid
+        # address is permission to proceed, not an instruction to re-open a
+        # lead the pipeline has already moved on from.
+        record["next_retry_at"] = None
+    elif decision == "reject":
+        fields["status"] = "rejected"
+        record["next_retry_at"] = None
+    elif decision == "hold":
+        fields["status"] = "hold"
+        record["next_retry_at"] = None
+    else:  # retry
+        mins = EV.next_retry_minutes(attempts)
+        if mins is None or EV.exhausted(attempts):
+            # Out of attempts. It stays unknown and goes to a human -- it is
+            # NOT reclassified as invalid, because nothing ever established
+            # that it was undeliverable.
+            record["next_retry_at"] = None
+            record["exhausted"] = True
+            fields["status"] = "hold"
+        else:
+            record["next_retry_at"] = _iso(
+                now + datetime.timedelta(minutes=mins))
+
+    fields["raw_data"] = _merged_raw(lead, record)
+    return {"fields": fields, "decision": decision, "record": record}
+
+
+def reject_unusable(lead: Dict[str, Any],
+                    now: Optional[datetime.datetime] = None) -> Dict[str, Any]:
+    """An address the verifier need never see: absent or structurally impossible."""
+    now = now or _now()
+    email = EV.normalise(lead.get("email"))
+    reason = "missing_email" if not email else "missing_at_sign"
+    record = {
+        "status": "invalid", "decision": "reject", "deliverable": False,
+        "score": 0, "reason": reason, "flags": [], "did_you_mean": None,
+        "mx_host": None, "cached": False, "took_ms": 0, "error": None,
+        "verified_email": email, "verified_at": _iso(now),
+        "last_attempt_at": _iso(now), "attempts": 1, "next_retry_at": None,
+        "local_check": True,
+    }
+    return {"fields": {"email_verification_status": "invalid",
+                       "email_verified": False, "status": "rejected",
+                       "raw_data": _merged_raw(lead, record)},
+            "decision": "reject", "record": record}
+
+
+def tick(limit: int = 200, batch_size: Optional[int] = None,
+         now: Optional[datetime.datetime] = None) -> Dict[str, Any]:
+    """One pass: select, verify, persist. Returns a summary for the cron log."""
+    now = now or _now()
+    out = {"considered": 0, "verified": 0, "eligible": 0, "reject": 0,
+           "hold": 0, "retry": 0, "unusable": 0, "errors": [], "took_ms": 0}
+
+    if not EV.configured():
+        out["errors"].append("email verifier is not configured")
+        return out
+    if not S.configured():
+        out["errors"].append("supabase is not configured")
+        return out
+
+    try:
+        rows = fetch_candidates(limit)
+    except Exception as exc:
+        out["errors"].append("supabase: %s" % EV.scrub(str(exc)))
+        return out
+
+    out["considered"] = len(rows)
+    by_email: Dict[str, List[Dict[str, Any]]] = {}
+    for lead in rows:
+        email = EV.normalise(lead.get("email"))
+        if not email or "@" not in email:
+            try:
+                res = reject_unusable(lead, now)
+                _patch(lead["id"], res["fields"])
+                out["unusable"] += 1
+            except Exception as exc:
+                out["errors"].append("patch %s: %s"
+                                     % (lead.get("id"), EV.scrub(str(exc))))
+            continue
+        if not due_for_verification(lead, now):
+            continue
+        by_email.setdefault(email, []).append(lead)
+
+    t0 = _now()
+    for chunk in EV.batches(by_email.keys(), batch_size):
+        try:
+            results = EV.verify_batch(chunk)
+        except Exception as exc:
+            out["errors"].append("verify: %s" % EV.scrub(str(exc)))
+            continue
+        for result in results:
+            for lead in by_email.get(result["email"], []):
+                try:
+                    applied = apply_result(lead, result, now)
+                    _patch(lead["id"], applied["fields"])
+                    out["verified"] += 1
+                    key = {"eligible": "eligible", "reject": "reject",
+                           "hold": "hold", "retry": "retry"}[applied["decision"]]
+                    out[key] += 1
+                except Exception as exc:
+                    out["errors"].append("patch %s: %s"
+                                         % (lead.get("id"), EV.scrub(str(exc))))
+    out["took_ms"] = int((_now() - t0).total_seconds() * 1000)
+    return out
+
+
+# --- the admission gate -----------------------------------------------------
+
+def claimable_filter() -> str:
+    """The PostgREST predicate a lead must satisfy to reach Hermes.
+
+    Kept here, next to the policy it enforces, rather than inline at the call
+    site, so that "what may be claimed" has exactly one definition. The
+    verified-address check that makes a changed email invalidate its old
+    verdict cannot be expressed in PostgREST across two columns, so it is
+    applied by `claim_guard` on the rows this returns.
+    """
+    return ("status=eq.ready&hermes_status=eq.not_imported"
+            "&email_verification_status=eq.valid&email_verified=is.true")
+
+
+def claim_guard(lead: Dict[str, Any]) -> Tuple[bool, str]:
+    """Final structural check before a lead is handed to Hermes.
+
+    Returns (allowed, reason). This is the check that survives an email being
+    edited after verification: the verdict is only good for the address it was
+    recorded against.
+    """
+    email = EV.normalise(lead.get("email"))
+    if not email or "@" not in email:
+        return False, "no usable email"
+    if (lead.get("email_verification_status") or "").lower() != "valid":
+        return False, ("verification is %s, not valid"
+                       % (lead.get("email_verification_status") or "missing"))
+    if not lead.get("email_verified"):
+        return False, "email_verified is not true"
+    rec = record_of(lead)
+    if EV.stale(rec, email):
+        return False, ("verified address %r no longer matches %r"
+                       % ((rec or {}).get("verified_email"), email))
+    return True, "verified valid"
+
+
+def counts(now: Optional[datetime.datetime] = None) -> Dict[str, Any]:
+    """Verification totals for ORBIT. Deterministic, from the table itself."""
+    out = {"valid": 0, "invalid": 0, "risky": 0, "unknown": 0, "pending": 0,
+           "error": None}
+    if not S.configured():
+        out["error"] = "supabase is not configured"
+        return out
+    try:
+        for status in ("valid", "invalid", "risky", "unknown"):
+            rows = S._call(
+                "leads?select=id&is_active=eq.true"
+                "&email_verification_status=eq." + status, prefer="count=exact")
+            out[status] = len(rows or [])
+        rows = S._call("leads?select=id&is_active=eq.true"
+                       "&email_verification_status=is.null")
+        out["pending"] = len(rows or [])
+    except Exception as exc:
+        out["error"] = EV.scrub(str(exc))
+    return out

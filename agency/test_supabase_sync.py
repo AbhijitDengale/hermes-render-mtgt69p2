@@ -69,6 +69,13 @@ class FakeSupabase:
                 "provider_message_id": None, "provider_thread_id": None,
                 "reply_classification": None, "last_error": None,
                 "is_active": True,
+                # Verified valid for exactly this address, which is what the
+                # claim gate now requires before a row may enter Hermes.
+                "email_verification_status": "valid", "email_verified": True,
+                "raw_data": {"email_verification": {
+                    "status": "valid", "attempts": 1,
+                    "verified_email": "sync-test-%03d@example.com"
+                    % (len(self.rows) + 1)}},
             }
             made.append(sid)
         return made
@@ -85,6 +92,10 @@ class FakeSupabase:
             with self.lock:
                 self.rows.setdefault(sid, {}).update(body or {})
             return []
+        if path.startswith("leads?select=") and "id=in.(" in path and method == "GET":
+            ids = path.split("id=in.(")[1].split(")")[0].split(",")
+            with self.lock:
+                return [dict(self.rows[i]) for i in ids if i in self.rows]
         return []
 
     def rpc(self, name, args):
@@ -196,6 +207,27 @@ def main():
           all(r["hermes_status"] == "imported" for r in fake.rows.values()))
     check("   and carries the Hermes id back",
           all(r["hermes_lead_id"] for r in fake.rows.values()))
+
+    # --- the verification gate, inside the real claim path -----------------
+    unverified = fake.add(1, prefix="U")[0]
+    fake.rows[unverified]["email_verification_status"] = None
+    fake.rows[unverified]["email_verified"] = None
+    fake.rows[unverified]["raw_data"] = {}
+    # The suite has closed `con` by here; count through a fresh connection.
+    with P.connect() as c_gate:
+        before_leads = c_gate.execute("SELECT count(*) FROM leads").fetchone()[0]
+    gate = S.claim(limit=5)
+    check("   an unverified lead is claimed by the RPC but NOT imported",
+          gate.get("unverified") == 1 and gate.get("imported") == 0,
+          "unverified=%s imported=%s" % (gate.get("unverified"), gate.get("imported")))
+    check("   it is released back to not_imported, not lost",
+          fake.rows[unverified]["hermes_status"] == "not_imported",
+          fake.rows[unverified]["hermes_status"])
+    with P.connect() as c_gate:
+        after_leads = c_gate.execute("SELECT count(*) FROM leads").fetchone()[0]
+    check("   and nothing new reached agency.db", after_leads == before_leads,
+          "%d -> %d" % (before_leads, after_leads))
+    del fake.rows[unverified]
     with P.connect(db) as con:
         n = con.execute("SELECT COUNT(*) c FROM supabase_leads").fetchone()["c"]
         st = con.execute("SELECT state FROM leads LIMIT 1").fetchone()["state"]

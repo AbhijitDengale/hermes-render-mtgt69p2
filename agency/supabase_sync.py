@@ -41,6 +41,7 @@ import pipeline as P      # noqa: E402
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SECRET = os.getenv("SUPABASE_SECRET_KEY", "")
+CLAIM_RPC = (os.getenv("SUPABASE_CLAIM_RPC", "") or "claim_leads_for_hermes").strip()
 BATCH_SIZE = int(os.getenv("SUPABASE_LEAD_BATCH_SIZE", "20"))
 DAILY_TARGET = int(os.getenv("AGENCY_DAILY_LEAD_TARGET", "400"))
 TZ_OFFSET_MINUTES = int(os.getenv("AGENCY_TZ_OFFSET_MINUTES", "330"))   # Asia/Kolkata
@@ -226,6 +227,39 @@ def normalize(row: Dict[str, Any], default_campaign: str) -> Dict[str, Any]:
     return out
 
 
+def _verification_verdicts(ids):
+    """Verification fields for the rows just claimed, keyed by id.
+
+    Fetched in one request rather than per row. On any failure this returns
+    None, which `_verification_allows` treats as "cannot confirm" -- the gate
+    fails closed, so a Supabase hiccup delays leads rather than admitting
+    unverified ones.
+    """
+    ids = [str(i) for i in ids if i]
+    if not ids:
+        return {}
+    try:
+        rows = _call("leads?select=id,email,email_verification_status,"
+                     "email_verified,raw_data&id=in.(%s)" % ",".join(ids)) or []
+        return {str(r.get("id")): r for r in rows if isinstance(r, dict)}
+    except Exception:
+        return None
+
+
+def _verification_allows(sid, verdicts):
+    """Whether this claimed lead may be imported. Fails closed."""
+    if verdicts is None:
+        return False, "could not read verification state"
+    row = verdicts.get(str(sid))
+    if row is None:
+        return False, "no verification row"
+    try:
+        import verification_worker as VW
+        return VW.claim_guard(row)
+    except Exception as exc:
+        return False, "verification check failed: %s" % _sanitize(str(exc))
+
+
 def claim(limit: int = None, campaign: str = "C-LEADSKING",
           dry_run: bool = False) -> Dict[str, Any]:
     """Claim ready leads and import them. Atomic on the Supabase side.
@@ -254,12 +288,37 @@ def claim(limit: int = None, campaign: str = "C-LEADSKING",
         out["skipped"] = "dry run"
         return out
 
-    rows = rpc("claim_leads_for_hermes", {"p_limit": limit}) or []
+    # Which claim function to use is runtime configuration, not code: once
+    # claim_verified_leads_for_hermes() exists in Supabase (see
+    # migrations/supabase/009_email_verification_gate.sql), switching to it is
+    # one env var. The Python guard below stays on either way.
+    rows = rpc(CLAIM_RPC, {"p_limit": limit}) or []
     out["claimed"] = len(rows)
+    out["unverified"] = 0
+
+    # The verification gate. claim_leads_for_hermes() does not know about email
+    # verification, so the verdict is fetched for exactly the rows it just
+    # claimed and checked here -- at the one place every Supabase lead enters
+    # Hermes, rather than anywhere a caller might forget.
+    #
+    # Checked after the claim rather than before it because the claim is what
+    # makes the set atomic: two ticks cannot hold the same row, so releasing an
+    # unverified one is safe and cannot strand it.
+    verdicts = _verification_verdicts([r.get("id") for r in rows])
 
     for row in rows:
         sid = row.get("id")
         try:
+            allowed, why = _verification_allows(sid, verdicts)
+            if not allowed:
+                # Released, not rejected at source: the lead is fine, it simply
+                # has not been cleared yet, and the verifier tick may clear it
+                # on a later pass.
+                rpc("release_lead_claim", {"p_id": sid})
+                out["released"] += 1
+                out["unverified"] += 1
+                continue
+
             data = normalize(row, campaign)
             if not data["email"] or not data["business_name"]:
                 # Never silently lost: released so it can be fixed at source.

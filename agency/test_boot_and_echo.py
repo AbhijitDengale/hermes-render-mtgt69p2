@@ -93,14 +93,17 @@ def main():
     check("--check reports both jobs missing and changes nothing",
           inst.main() == 1 and len(json.load(open(jobs_path))) == 1)
 
+    # Seed every job the installer manages, from its own list, so this test
+    # does not go stale each time a job is added to WANTED.
     jobs = json.load(open(jobs_path))
-    for name, jid, script in (("leo-inbound", "f84e", "leo_inbound_tick.py"),
-                              ("echo-followups", "d802", "echo_followups.py")):
-        jobs.append({"name": name, "id": jid, "schedule_display": "every 2m",
-                     "script": script, "no_agent": True, "deliver": "local"})
+    for w in inst.WANTED:
+        jobs.append({"name": w["name"], "id": w["name"][:4],
+                     "schedule_display": w["schedule"], "script": w["script"],
+                     "no_agent": True, "deliver": "local"})
     json.dump(jobs, open(jobs_path, "w"))
 
-    check("with both present the installer is a no-op", inst.main() == 0)
+    check("with all managed jobs present the installer is a no-op",
+          inst.main() == 0)
     check("  and re-running still creates nothing", inst.main() == 0)
     names = [j["name"] for j in json.load(open(jobs_path))]
     check("  exactly one of each after three runs",

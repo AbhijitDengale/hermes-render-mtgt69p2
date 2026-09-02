@@ -28,6 +28,9 @@ WANTED = [
     {"name": "echo-followups", "script": "echo_followups.py",
      "schedule": "every 2m",
      "why": "dispatches follow-ups that are already scheduled and due"},
+    {"name": "email-verifier", "script": "email_verifier_tick.py",
+     "schedule": "every 2m",
+     "why": "verifies lead addresses; only valid ones become claimable"},
 ]
 
 

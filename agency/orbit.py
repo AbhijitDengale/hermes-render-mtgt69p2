@@ -92,6 +92,7 @@ CRON_STALE_MINUTES = {
     "maya-orchestrator": 30,
     "leo-inbound": 30,
     "echo-followups": 30,
+    "email-verifier": 30,
     "supabase-lead-sync": 60,
     "review-alerts": 60,
     "orbit-daily": 60 * 26,
@@ -311,6 +312,21 @@ def collect(db: str = None) -> Dict[str, Any]:
         m["research_error"] = "%s: %s" % (type(exc).__name__, exc)
 
     m["automation"] = automation_health()
+
+    # --- email verification -------------------------------------------------
+    # Counted from Supabase, never inferred. Pass rate uses completed verdicts
+    # as its denominator (valid+invalid+risky+unknown), so it can never exceed
+    # 100% and a backlog of pending leads does not flatter it.
+    try:
+        import verification_worker as VW
+        m["verification"] = VW.counts()
+    except Exception as exc:
+        m["verification"] = {"error": "%s: %s" % (type(exc).__name__, exc)}
+    v = m["verification"]
+    if not v.get("error"):
+        done = sum(v.get(k, 0) for k in ("valid", "invalid", "risky", "unknown"))
+        m["verification_completed"] = done
+        m["verification_pass_rate"] = rate(v.get("valid", 0), done)
 
     # --- capacity across every tenant --------------------------------------
     # ORBIT holds a read-only key for one tenant, so /api/v1/accounts shows it
@@ -581,6 +597,27 @@ def report(m: Dict[str, Any]) -> str:
             L.append("  DUPLICATE JOB NAMES: %s" % ", ".join(a["duplicates"]))
         if not a.get("stale") and not a.get("never_ran"):
             L.append("  All scheduled jobs have run recently.")
+    L.append("")
+
+    # ---- EMAIL VERIFICATION ----------------------------------------------
+    v = m.get("verification") or {}
+    L.append("**EMAIL VERIFICATION**")
+    if v.get("error"):
+        L.append("  unavailable: %s" % v["error"])
+    else:
+        L.append("  Pending:                    %s" % num(v.get("pending")))
+        L.append("  Valid:                      %s" % num(v.get("valid")))
+        L.append("  Invalid:                    %s" % num(v.get("invalid")))
+        L.append("  Risky (held):               %s" % num(v.get("risky")))
+        L.append("  Unknown (retrying):         %s" % num(v.get("unknown")))
+        L.append("  Pass rate:                  %s"
+                 % pct(m.get("verification_pass_rate"),
+                       m.get("verification_completed")))
+        L.append("  (valid / completed verdicts — a pending backlog is not "
+                 "counted against it)")
+    # The verifier's own cron is already covered by the AUTOMATION block above;
+    # a stale email-verifier shows there with everything else, so a verifier
+    # outage cannot hide inside a section of its own.
     L.append("")
 
     # ---- PIPELINE --------------------------------------------------------
