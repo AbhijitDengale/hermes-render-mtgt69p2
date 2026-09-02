@@ -120,7 +120,15 @@ def main():
     con = sqlite3.connect(db)
     con.row_factory = sqlite3.Row
     con.execute("INSERT INTO campaigns (id,name,status) VALUES ('c1','c','active')")
-    past = "2020-01-01T00:00:00"
+    # due() compares scheduled_for against SQLite's datetime('now') as strings,
+    # so the separator matters: "T" sorts after " ", and an ISO-with-T
+    # timestamp for today would never compare as due. A far-past date would
+    # hide that, because the year decides the comparison before the separator
+    # is reached -- so use the same formatter production uses.
+    past = F._fmt(datetime.datetime.now(datetime.timezone.utc)
+                  - datetime.timedelta(minutes=5))         if hasattr(F, "_fmt") else (datetime.datetime.now(datetime.timezone.utc)
+                                    - datetime.timedelta(minutes=5)
+                                    ).strftime("%Y-%m-%d %H:%M:%S")
     # LP lives in its own campaign so it can be paused before its first tick.
     # In c1 it would simply be dispatched by the tick below and the pause test
     # would be asserting against an already-dispatched follow-up.
@@ -142,7 +150,7 @@ def main():
                 " VALUES ('LF','c1','f@example.invalid','FOLLOWUP_WAITING')")
     con.commit()
     future = (datetime.datetime.now(datetime.timezone.utc)
-              + datetime.timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S")
+              + datetime.timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
     with P.writing(con):
         F.schedule(con, "LF", "c1", 1, future)
 
@@ -230,6 +238,26 @@ def main():
     check("  no lead is released twice",
           len({l.split()[1] for l in moved if l.startswith("due")}) == len(
               [l for l in moved if l.startswith("due")]))
+
+    print("\n--- Scheduled timestamps are comparable with SQLite's clock ---")
+    # This is the trap: due() is a string comparison, so a follow-up written
+    # with an ISO "T" separator is never due on the same day it was scheduled.
+    con.execute("INSERT INTO leads (id,campaign_id,email,state)"
+                " VALUES ('LT','c1','t@example.invalid','FOLLOWUP_WAITING')")
+    con.commit()
+    stamped = F.next_due(con, "c1", 1)
+    check("next_due produces a space-separated timestamp",
+          stamped is None or "T" not in stamped, str(stamped))
+    sqlite_now = con.execute("SELECT datetime('now')").fetchone()[0]
+    check("  matching the format SQLite's datetime('now') returns",
+          "T" not in sqlite_now, sqlite_now)
+    overdue = (datetime.datetime.now(datetime.timezone.utc)
+               - datetime.timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
+    with P.writing(con):
+        F.schedule(con, "LT", "c1", 1, overdue)
+    check("  a follow-up one minute overdue TODAY is seen as due",
+          any(r["lead_id"] == "LT" for r in F.due(con, 50)),
+          "same-day comparison, where the separator actually decides it")
 
     # ------------------------------------------------------------------ 15.15
     print("\n--- ORBIT notices a stalled scheduler (15.15) ---")
