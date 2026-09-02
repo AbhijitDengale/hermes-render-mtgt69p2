@@ -355,10 +355,12 @@ def queue_and_send(con, lead) -> Optional[str]:
             con.execute(
                 "UPDATE messages SET status=?, provider_message_id=?,"
                 "       provider_thread_id=?, mailhub_account_id=?,"
+                "       from_email=COALESCE(?, from_email),"
                 "       sent_at=?, dry_run=?, updated_at=datetime('now') "
                 " WHERE id=?",
                 (st, status.get("provider_message_id"),
                  status.get("provider_thread_id"), status.get("account_id"),
+                 sender_shown,
                  status.get("sent_at"), 1 if st == "simulated" else 0,
                  draft["id"]))
             P.transition(con, lead["id"], "SENT", AGENT,
@@ -374,8 +376,9 @@ def queue_and_send(con, lead) -> Optional[str]:
         _mirror(con, lead["id"], "sent",
                 {"sender": sender_shown, "provider_message_id": status.get("provider_message_id"),
                  "provider_thread_id": status.get("provider_thread_id")})
-        return "READY_TO_SEND -> SENT (%s, provider %s)" % (
-            st, status.get("provider_message_id"))
+        return "READY_TO_SEND -> SENT (%s, provider %s, as %s)" % (
+            st, status.get("provider_message_id"),
+            sender_shown or "sender not recorded")
     if st in ("failed", "dead", "needs_review", "cancelled"):
         with P.writing(con):
             P.transition(con, lead["id"], "ERROR", AGENT,

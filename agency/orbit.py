@@ -179,6 +179,14 @@ def collect(db: str = None) -> Dict[str, Any]:
             "SELECT COUNT(*) FROM messages WHERE followup_stage>0"
             "   AND status IN ('sent','simulated')")
         m["outbound_total"] = m["initial_sent"] + m["followups_sent"]
+        # The sender each prospect saw. Recorded by the orchestrator from
+        # MailHub's confirmation; a NULL means the message went out before
+        # the identity was recorded (the Gmail-From incident) -- reported,
+        # never hidden.
+        m["sent_as"] = [(r[0], r[1]) for r in con.execute(
+            "SELECT from_email, COUNT(*) FROM messages"
+            " WHERE direction='outbound' AND status IN ('sent','simulated')"
+            " GROUP BY from_email ORDER BY COUNT(*) DESC, from_email")]
         m["send_failures"] = scalar(
             "SELECT COUNT(*) FROM messages WHERE status='failed'")
         # Handed to MailHub, not yet confirmed by a provider. Deliberately
@@ -480,6 +488,8 @@ def report(m: Dict[str, Any]) -> str:
     L.append("  Queued (awaiting provider): %d" % m.get("queued", 0))
     L.append("  Sent (initial + follow-up): %d  (%d + %d)"
              % (m["outbound_total"], m["initial_sent"], m["followups_sent"]))
+    for addr, n in (m.get("sent_as") or []):
+        L.append("  Sent as %-20s %d" % ((addr or "(sender not recorded)") + ":", n))
     L.append("  Send failed:                %d" % m["send_failures"])
     L.append("")
 
@@ -552,15 +562,23 @@ def report(m: Dict[str, Any]) -> str:
         L.append("  Remaining safe capacity:    %d" % max(0, cap - sent_today))
         L.append("  Warming:                    %d" % len(warming))
         L.append("  Paused / blocked:           %d" % len(paused))
+        # The identity each mailbox sends as. A mailbox without a verified
+        # professional identity cannot send: MailHub holds its messages.
+        def sends_as(a):
+            if a.get("identity_status") == "verified" and a.get("from_email"):
+                return "as %s" % (("%s <%s>" % (a.get("from_name"), a["from_email"]))
+                                  if a.get("from_name") else a["from_email"])
+            return "NO VERIFIED SENDER IDENTITY (%s) - sends held" % (
+                a.get("identity_status") or "not discovered")
         for a in active:
             lim = a.get("effective_daily_limit") or 0
-            L.append("    %-30s %-9s %3d/%-3d  %d left"
+            L.append("    %-30s %-9s %3d/%-3d  %d left  %s"
                      % (a.get("email"), a.get("health"),
                         a.get("sent_today") or 0, lim,
-                        max(0, lim - (a.get("sent_today") or 0))))
+                        max(0, lim - (a.get("sent_today") or 0)), sends_as(a)))
         for a in paused:
-            L.append("    %-30s paused    excluded from capacity"
-                     % a.get("email"))
+            L.append("    %-30s paused    excluded from capacity  %s"
+                     % (a.get("email"), sends_as(a)))
 
     ts = m.get("tenants") or []
     if ts:
