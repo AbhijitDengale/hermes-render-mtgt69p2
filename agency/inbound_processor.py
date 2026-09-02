@@ -131,6 +131,15 @@ def record(con, ev: Dict[str, Any]) -> Optional[int]:
     return row["id"] if row else None
 
 
+def _mirror(con, lead_id: str, event: str, payload: dict) -> None:
+    """Queue a Supabase write-back. Never raises into the pipeline."""
+    try:
+        import supabase_sync
+        supabase_sync.enqueue(lead_id, event, payload, con)
+    except Exception:
+        pass
+
+
 def process_one(con, ev: Dict[str, Any]) -> str:
     lead_id = ev.get("lead_id")
 
@@ -177,13 +186,36 @@ def process_one(con, ev: Dict[str, Any]) -> str:
             con.execute("UPDATE inbound_replies SET leo_task_id=? WHERE id=?",
                         (task, reply_id))
 
-    # Consume it in MailHub so the same reply is not offered again.
-    if ev.get("inbound_id"):
+    # --- 4. mirror the outcome ---------------------------------------------
+    # Queued, not written through: the reply is already recorded and the
+    # follow-ups already cancelled, so a Supabase outage is a retry rather
+    # than a reason to reprocess a reply that was handled correctly here.
+    _mirror(con, lead_id, "reply_received", {
+        "tenant_user_id": ev.get("tenant_user_id"),
+        "provider_message_id": ev.get("provider_message_id"),
+        "is_bounce": bool(ev.get("is_bounce")),
+        "is_auto_reply": bool(ev.get("is_auto_reply")),
+        "followups_cancelled": n,
+        "state": moved,
+    })
+
+    # --- 5. consume, but only what was actually handled ---------------------
+    # If LEO could not be dispatched, the reply has been recorded and its
+    # follow-ups cancelled -- the protective half is done -- but nothing has
+    # classified it yet. Leaving it unconsumed lets the next tick try again;
+    # consuming it here would lose the classification silently. The record row
+    # makes the retry safe: it will not be processed twice.
+    if ev.get("inbound_id") and task:
         mailhub("POST", "/api/v1/inbound/%s/consume" % ev["inbound_id"],
                 token=ev.get("_token"))
+        consumed = "consumed"
+    elif ev.get("inbound_id"):
+        consumed = "left for retry (LEO not dispatched)"
+    else:
+        consumed = "nothing to consume"
 
-    return ("reply %d lead=%s cancelled=%d -> %s leo=%s"
-            % (reply_id, lead_id, n, moved, task or "not dispatched"))
+    return ("reply %d lead=%s cancelled=%d -> %s leo=%s (%s)"
+            % (reply_id, lead_id, n, moved, task or "not dispatched", consumed))
 
 
 def poll(limit: int = 25) -> List[str]:
