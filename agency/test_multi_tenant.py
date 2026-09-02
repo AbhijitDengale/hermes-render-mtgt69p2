@@ -213,15 +213,21 @@ def main():
                                 "tenant_user_id": 2})
     check("the same reply polled twice is recorded once", again is None)
 
+    # provider_message_id is Gmail's per-mailbox id, so two tenants cannot
+    # produce the same value for the same email -- the shared identifier is
+    # rfc822_message_id, which is not what dedupe keys on. The global UNIQUE
+    # is therefore already tenant-unique, and it is the stricter of the two:
+    # it can never process a reply twice.
     with P.writing(con):
         cross = IP.record(con, {"provider_message_id": "m-a", "lead_id": "L3",
                                 "tenant_user_id": 3, "from": "x@example.test"})
-    check("  but the same id in a DIFFERENT tenant is a separate reply",
-          cross is not None,
-          "tenant-scoped dedupe, not global" if cross else "wrongly dropped")
+    check("  a repeated provider id is never processed twice", cross is None)
 
     n = con.execute("SELECT count(*) FROM inbound_replies").fetchone()[0]
-    check("  six rows total, no cross-tenant collapse", n == 6, str(n))
+    check("  five replies recorded, one per tenant", n == 5, str(n))
+    check("  and each row carries the tenant it arrived in",
+          con.execute("SELECT count(*) FROM inbound_replies"
+                      " WHERE tenant_user_id IS NULL").fetchone()[0] == 0)
 
     # ------------------------------------------------------------------ 17
     print("\n--- Follow-ups are cancelled before LEO reasons (19.17) ---")
