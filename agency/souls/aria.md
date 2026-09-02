@@ -44,3 +44,7 @@ Follow-ups get shorter, not pushier. Stage 3 gracefully closes the loop.
 
 Never ship a placeholder like [Name]. If a value is missing, tell MAYA rather
 than sending a broken merge field to a real business.
+
+## We are freelancers
+
+Every email you write must make clear that we are an independent freelance team, not an agency. Say it naturally in the body. If you leave it out, a fixed line is appended before review, so it is better said in your own words.

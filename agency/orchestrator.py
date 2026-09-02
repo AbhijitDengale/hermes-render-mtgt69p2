@@ -346,6 +346,10 @@ def queue_and_send(con, lead) -> Optional[str]:
     status = mailhub("GET", "/api/v1/messages/%s" % draft["mailhub_queue_id"],
                      token=tok)
     st = status.get("status")
+    # The identity the prospect saw. MailHub records it on the message at
+    # dispatch; it is the professional alias, never the transport mailbox.
+    sender_shown = ((status.get("from_name") or "").strip() + " <" + status["from_email"] + ">"
+                    ).strip() if status.get("from_email") else None
     if st in ("sent", "simulated"):
         with P.writing(con):
             con.execute(
@@ -368,7 +372,7 @@ def queue_and_send(con, lead) -> Optional[str]:
         # Only here, where the provider has confirmed. A queued message is
         # not a sent one and the mirror must not claim otherwise.
         _mirror(con, lead["id"], "sent",
-                {"provider_message_id": status.get("provider_message_id"),
+                {"sender": sender_shown, "provider_message_id": status.get("provider_message_id"),
                  "provider_thread_id": status.get("provider_thread_id")})
         return "READY_TO_SEND -> SENT (%s, provider %s)" % (
             st, status.get("provider_message_id"))

@@ -179,6 +179,20 @@ def t_save_research(a: Dict[str, Any]) -> Dict[str, Any]:
             "observations": len(obs)}
 
 
+FREELANCE_LINE = os.getenv(
+    "AGENCY_FREELANCE_LINE",
+    "P.S. We're an independent freelance team \u2014 you work directly with the "
+    "people doing the work, with no agency overhead.")
+
+
+def ensure_freelance_line(body: str) -> str:
+    """Append the freelancing line unless the body already says so."""
+    text = (body or "").rstrip()
+    if "freelanc" in text.lower():
+        return text
+    return text + "\n\n" + FREELANCE_LINE
+
+
 def t_save_draft(a: Dict[str, Any]) -> Dict[str, Any]:
     """ARIA's output. Every claim must name a source URL present in research."""
     lead_id = a["lead_id"]
@@ -187,6 +201,12 @@ def t_save_draft(a: Dict[str, Any]) -> Dict[str, Any]:
     claims = a.get("claims_used") or []
     if not subject or not body:
         return {"error": "subject and body are required"}
+    # Every outreach email says that we are freelancing. Added here, before
+    # the draft is stored and hashed, so SENTINEL reviews and approves the
+    # exact text that will be sent -- the line is part of the approved body,
+    # not something bolted on after the QA gate. Deterministic and idempotent:
+    # if ARIA already said it, nothing is appended.
+    body = ensure_freelance_line(body)
     for token in ("[", "]", "{{", "}}"):
         if token in subject or token in body:
             return {"error": "unresolved placeholder %r in the copy" % token}
