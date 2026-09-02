@@ -26,7 +26,7 @@ for path in ("/opt/data/.env",):
                 if sep and key in ("SUPABASE_URL", "SUPABASE_SECRET_KEY",
                                    "SUPABASE_LEAD_BATCH_SIZE",
                                    "AGENCY_DAILY_LEAD_TARGET",
-                                   "SUPABASE_CAMPAIGN"):
+                                   "SUPABASE_CAMPAIGN", "SUPABASE_CLAIM_RPC"):
                     os.environ.setdefault(key, value.strip())
 
 import supabase_sync as S  # noqa: E402
@@ -36,10 +36,16 @@ if not S.configured():
 
 lines = []
 claimed = S.claim()
-if claimed.get("imported") or claimed.get("rejected") or claimed.get("errors"):
-    lines.append("claimed %d, imported %d, duplicate %d, released %d"
+# A tick that claims rows and releases every one of them as unverified is not
+# "nothing to do" -- it is the claim window being spent on leads that cannot be
+# admitted, which starves the ones that can. That has to be visible.
+if (claimed.get("imported") or claimed.get("rejected") or claimed.get("errors")
+        or claimed.get("unverified")):
+    lines.append("claimed %d, imported %d, duplicate %d, released %d "
+                 "(unverified %d)"
                  % (claimed.get("claimed", 0), claimed.get("imported", 0),
-                    claimed.get("duplicate", 0), claimed.get("released", 0)))
+                    claimed.get("duplicate", 0), claimed.get("released", 0),
+                    claimed.get("unverified", 0)))
     for e in (claimed.get("errors") or [])[:3]:
         lines.append("  error: %s" % e)
 

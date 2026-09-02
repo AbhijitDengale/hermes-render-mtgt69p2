@@ -283,9 +283,11 @@ def collect(db: str = None) -> Dict[str, Any]:
     # --- lead intake against the daily target ------------------------------
     # Counted from agency.db, never asked of a model. The operational day is
     # Asia/Kolkata so the target rolls over when the operator's day does.
+    day_str = None
     try:
         import supabase_sync as S
         day = S.operational_day()
+        day_str = day
         with P.connect(db) as con:
             m["intake_day"] = day
             m["intake_today"] = S.imported_today(con, day)
@@ -312,6 +314,17 @@ def collect(db: str = None) -> Dict[str, Any]:
         m["research_error"] = "%s: %s" % (type(exc).__name__, exc)
 
     m["automation"] = automation_health()
+
+    # --- leads with no email address ----------------------------------------
+    # Counted from Supabase. These are a separate population from the email
+    # funnel: not pending, not invalid, never verified, never claimed. Their
+    # route is a person, and the full list follows this report.
+    try:
+        import no_email_report as NE
+        _ne_leads = NE.fetch_no_email_leads()
+        m["no_email"] = NE.summary(_ne_leads, day_str)
+    except Exception as exc:
+        m["no_email"] = {"error": "%s: %s" % (type(exc).__name__, exc)}
 
     # --- email verification -------------------------------------------------
     # Counted from Supabase, never inferred. Pass rate uses completed verdicts
@@ -618,6 +631,29 @@ def report(m: Dict[str, Any]) -> str:
     # The verifier's own cron is already covered by the AUTOMATION block above;
     # a stale email-verifier shows there with everything else, so a verifier
     # outage cannot hide inside a section of its own.
+    L.append("")
+
+    # ---- NO EMAIL LEADS --------------------------------------------------
+    ne = m.get("no_email") or {}
+    L.append("**NO EMAIL LEADS — MANUAL CONTACT REQUIRED**")
+    if ne.get("error"):
+        L.append("  unavailable: %s" % ne["error"])
+    else:
+        L.append("  Total missing email:        %s" % num(ne.get("total")))
+        L.append("  New today:                  %s" % num(ne.get("new_today")))
+        L.append("  Still unresolved:           %s" % num(ne.get("still_missing")))
+        if ne.get("by_country"):
+            L.append("  By country:                 %s"
+                     % ", ".join("%s: %d" % kv for kv in list(ne["by_country"].items())[:6]))
+        if ne.get("by_city"):
+            L.append("  Top cities:                 %s"
+                     % ", ".join("%s: %d" % kv for kv in list(ne["by_city"].items())[:6]))
+        if ne.get("by_source"):
+            L.append("  By source:                  %s"
+                     % ", ".join("%s: %d" % kv for kv in ne["by_source"].items()))
+        L.append("  OWNER / TEAM ACTION REQUIRED: these leads cannot enter automated")
+        L.append("  email outreach. The complete list, with contact details and a")
+        L.append("  suggested manual channel per lead, follows this report.")
     L.append("")
 
     # ---- PIPELINE --------------------------------------------------------

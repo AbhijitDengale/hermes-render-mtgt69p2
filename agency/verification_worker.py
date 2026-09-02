@@ -106,7 +106,7 @@ def fetch_candidates(limit: int = 200) -> List[Dict[str, Any]]:
     """
     cols = ("id,email,status,is_active,hermes_status,email_verification_status,"
             "email_verified,raw_data,updated_at")
-    q = ("leads?select=%s&is_active=eq.true&email=not.is.null"
+    q = ("leads?select=%s&is_active=eq.true&email=not.is.null&email=neq."
          "&order=updated_at.asc&limit=%d" % (cols, limit))
     rows = S._call(q) or []
     return [r for r in rows if isinstance(r, dict)]
@@ -187,7 +187,9 @@ def reject_unusable(lead: Dict[str, Any],
     """An address the verifier need never see: absent or structurally impossible."""
     now = now or _now()
     email = EV.normalise(lead.get("email"))
-    reason = "missing_email" if not email else "missing_at_sign"
+    # A blank address never reaches here (it is parked, not rejected); the
+    # only structurally impossible non-blank address is one without an "@".
+    reason = "missing_at_sign"
     record = {
         "status": "invalid", "decision": "reject", "deliverable": False,
         "score": 0, "reason": reason, "flags": [], "did_you_mean": None,
@@ -200,6 +202,121 @@ def reject_unusable(lead: Dict[str, Any],
                        "email_verified": False, "status": "rejected",
                        "raw_data": _merged_raw(lead, record)},
             "decision": "reject", "record": record}
+
+
+
+# The leads table has CHECK constraints on both status columns and Hermes
+# holds no DDL credential, so a dedicated 'no_email' value cannot be added.
+# The claim RPC filters on status = 'ready', and 'hold' is an accepted value,
+# so 'hold' is the lever: a lead with no address is held out of the claim and
+# marked NO_EMAIL in its metadata, with the status it had recorded so it goes
+# back to exactly that when an address appears. Risky-verdict leads also sit
+# in 'hold'; the two populations are told apart by the address itself.
+NO_EMAIL_HOLD_STATUS = "hold"
+NO_EMAIL_KEY = "no_email"
+NO_EMAIL_CLASS = "NO_EMAIL"
+
+
+def _blank(email: Optional[str]) -> bool:
+    return not (email or "").strip()
+
+
+def _raw(lead: Dict[str, Any]) -> Dict[str, Any]:
+    raw = lead.get("raw_data")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            raw = {}
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def route_no_email(now: Optional[datetime.datetime] = None,
+                   limit: int = 500) -> Dict[str, Any]:
+    """Keep leads without an address out of the email claim, structurally.
+
+    The claim RPC filters on status = 'ready'. A lead with no address is
+    held (status = 'hold') and classified NO_EMAIL in its metadata, so the
+    RPC never hands it out and the claim window is spent on leads that can
+    actually be admitted. It is NOT marked invalid -- a missing address and an
+    undeliverable one are different facts, and only one of them is a verdict
+    about the prospect -- and hermes_status is untouched.
+
+    The move is reversible by the data itself: when an address appears, the
+    lead goes straight back to not_imported with no verification recorded, so
+    the verifier picks it up on its next pass and only a valid verdict admits
+    it. first_seen_at is kept under raw_data.no_email so the evening report
+    can tell a new gap from one it has already shown.
+    """
+    now = now or _now()
+    out = {"parked": 0, "restored": 0, "errors": []}
+
+    # Park: in the claim window (ready, not imported) but no address.
+    try:
+        rows = S._call("leads?select=id,email,status,raw_data&status=eq.ready"
+                       "&hermes_status=eq.not_imported&is_active=eq.true"
+                       "&or=(email.is.null,email.eq.)&limit=%d" % limit) or []
+    except Exception as exc:
+        out["errors"].append("fetch no-email: %s" % EV.scrub(str(exc)))
+        rows = []
+    for lead in rows:
+        if not _blank(lead.get("email")):
+            continue
+        try:
+            _patch(lead["id"], park_fields(lead, now))
+            out["parked"] += 1
+        except Exception as exc:
+            out["errors"].append("park %s: %s" % (lead.get("id"), EV.scrub(str(exc))))
+
+    # Restore: held as NO_EMAIL earlier, has an address now. Selected by the
+    # hold status plus a present address, then confirmed by the marker so a
+    # risky-verdict hold is never mistaken for one of these.
+    try:
+        rows = S._call("leads?select=id,email,status,raw_data&status=eq.%s"
+                       "&email=not.is.null&email=neq.&limit=%d"
+                       % (NO_EMAIL_HOLD_STATUS, limit)) or []
+    except Exception as exc:
+        out["errors"].append("fetch restorable: %s" % EV.scrub(str(exc)))
+        rows = []
+    for lead in rows:
+        if _blank(lead.get("email")) or not is_no_email_hold(lead):
+            continue
+        try:
+            _patch(lead["id"], restore_fields(lead))
+            out["restored"] += 1
+        except Exception as exc:
+            out["errors"].append("restore %s: %s"
+                                 % (lead.get("id"), EV.scrub(str(exc))))
+    return out
+
+
+def is_no_email_hold(lead: Dict[str, Any]) -> bool:
+    """Whether this lead's hold is the NO_EMAIL kind (not a risky verdict)."""
+    return (_raw(lead).get(NO_EMAIL_KEY) or {}).get("classification") == NO_EMAIL_CLASS
+
+
+def park_fields(lead: Dict[str, Any], now: datetime.datetime) -> Dict[str, Any]:
+    """The columns that hold a no-address lead out of the claim. Pure."""
+    raw = _raw(lead)
+    marker = dict(raw.get(NO_EMAIL_KEY) or {})
+    marker.setdefault("first_seen_at", _iso(now))
+    marker["classification"] = NO_EMAIL_CLASS
+    marker.setdefault("prev_status", lead.get("status") or "ready")
+    raw[NO_EMAIL_KEY] = marker
+    return {"status": NO_EMAIL_HOLD_STATUS, "raw_data": raw}
+
+
+def restore_fields(lead: Dict[str, Any]) -> Dict[str, Any]:
+    """The columns that put a lead back once it has an address. Pure.
+
+    Back to the status it had, with no verdict recorded: the verifier decides
+    on its next pass, and only a valid verdict admits it.
+    """
+    raw = _raw(lead)
+    marker = raw.pop(NO_EMAIL_KEY, None) or {}
+    return {"status": marker.get("prev_status") or "ready",
+            "email_verification_status": None, "email_verified": None,
+            "raw_data": raw}
 
 
 def tick(limit: int = 200, batch_size: Optional[int] = None,
@@ -216,6 +333,11 @@ def tick(limit: int = 200, batch_size: Optional[int] = None,
         out["errors"].append("supabase is not configured")
         return out
 
+    routed = route_no_email(now)
+    out["no_email_parked"] = routed["parked"]
+    out["no_email_restored"] = routed["restored"]
+    out["errors"].extend(routed["errors"])
+
     try:
         rows = fetch_candidates(limit)
     except Exception as exc:
@@ -226,7 +348,19 @@ def tick(limit: int = 200, batch_size: Optional[int] = None,
     by_email: Dict[str, List[Dict[str, Any]]] = {}
     for lead in rows:
         email = EV.normalise(lead.get("email"))
-        if not email or "@" not in email:
+        if not email:
+            # Whitespace-only slips past the database filter. It is a missing
+            # address, not an invalid one, so it is parked for manual contact
+            # exactly like NULL -- never handed to the verifier, never marked
+            # invalid, never counted as a rejection.
+            try:
+                _patch(lead["id"], park_fields(lead, now))
+                out["no_email_parked"] = out.get("no_email_parked", 0) + 1
+            except Exception as exc:
+                out["errors"].append("park %s: %s"
+                                     % (lead.get("id"), EV.scrub(str(exc))))
+            continue
+        if "@" not in email:
             try:
                 res = reject_unusable(lead, now)
                 _patch(lead["id"], res["fields"])
@@ -285,7 +419,9 @@ def claim_guard(lead: Dict[str, Any]) -> Tuple[bool, str]:
     recorded against.
     """
     email = EV.normalise(lead.get("email"))
-    if not email or "@" not in email:
+    if not email:
+        return False, "NO_EMAIL: lead has no address; manual contact only"
+    if "@" not in email:
         return False, "no usable email"
     if (lead.get("email_verification_status") or "").lower() != "valid":
         return False, ("verification is %s, not valid"
@@ -313,8 +449,15 @@ def counts(now: Optional[datetime.datetime] = None) -> Dict[str, Any]:
                 "&email_verification_status=eq." + status, prefer="count=exact")
             out[status] = len(rows or [])
         rows = S._call("leads?select=id&is_active=eq.true"
-                       "&email_verification_status=is.null")
+                       "&email_verification_status=is.null"
+                       "&email=not.is.null&email=neq.")
         out["pending"] = len(rows or [])
+        # Leads with no address at all are a separate population: they are
+        # neither pending verification nor invalid, and they are reported to
+        # a person for manual contact rather than counted against the funnel.
+        rows = S._call("leads?select=id&is_active=eq.true"
+                       "&or=(email.is.null,email.eq.)")
+        out["no_email"] = len(rows or [])
     except Exception as exc:
         out["error"] = EV.scrub(str(exc))
     return out

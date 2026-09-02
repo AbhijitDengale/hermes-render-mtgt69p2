@@ -18,11 +18,17 @@ import verification_worker as VW  # noqa: E402
 
 res = VW.tick(limit=int(os.getenv("EMAIL_VERIFIER_SCAN_LIMIT", "200")))
 
-if res["verified"] or res["unusable"] or res["errors"]:
+parked = res.get("no_email_parked", 0)
+restored = res.get("no_email_restored", 0)
+if res["verified"] or res["unusable"] or res["errors"] or parked or restored:
     print("email-verifier: %d verified of %d considered in %dms"
           % (res["verified"], res["considered"], res["took_ms"]))
     print("  eligible=%d reject=%d hold=%d retry=%d unusable=%d"
           % (res["eligible"], res["reject"], res["hold"], res["retry"],
              res["unusable"]))
+    if parked or restored:
+        # Holding a lead out of the claim is a decision about it; say so.
+        print("  no-email: %d held for manual contact, %d restored (address added)"
+              % (parked, restored))
     for e in res["errors"][:8]:
         print("  error: %s" % e)

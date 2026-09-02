@@ -341,7 +341,11 @@ def stale(record: Optional[Dict[str, Any]], current_email: str) -> bool:
 def is_final(record: Optional[Dict[str, Any]]) -> bool:
     """Whether this verdict settles the matter and need not be re-checked.
 
-    Only valid and invalid are final. risky and unknown are both revisitable:
-    one awaits a human, the other awaits a working nameserver.
+    valid, invalid and risky are final for the address they were recorded
+    against. risky is held for a person -- a role account or a catch-all does
+    not stop being one because it was asked again two minutes later, and
+    asking again 150 times a tick was the whole verifier budget. Only unknown
+    is revisited, on its backoff, because unknown means the verifier could not
+    tell and a working nameserver may change that.
     """
-    return bool(record) and record.get("status") in ("valid", "invalid")
+    return bool(record) and record.get("status") in ("valid", "invalid", "risky")

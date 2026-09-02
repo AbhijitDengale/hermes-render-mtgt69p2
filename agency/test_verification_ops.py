@@ -73,6 +73,10 @@ def main():
 
     real = (VW.fetch_candidates, VW._patch, EV.verify_batch, EV.BASE, EV.API_KEY,
             VW.S.configured)
+    # The tick's first step routes no-email leads through S._call; none of
+    # these 25 lack an address, so the routing queries return nothing.
+    real_call = VW.S._call
+    VW.S._call = lambda path, method="GET", body=None, prefer=None: []
     VW.fetch_candidates, VW._patch, EV.verify_batch = fake_fetch, fake_patch, fake_verify
     EV.BASE, EV.API_KEY = "https://fake", "k"
     VW.S.configured = lambda: True
@@ -87,6 +91,7 @@ def main():
     finally:
         (VW.fetch_candidates, VW._patch, EV.verify_batch, EV.BASE, EV.API_KEY,
          VW.S.configured) = real
+        VW.S._call = real_call
 
     total_verified = sum(r["verified"] for r in results.values())
     check("four ticks ran over the same 25 leads without error",
@@ -104,6 +109,7 @@ def main():
     # Once every row holds a final verdict, another tick must be free: the
     # verifier's own cache is not what saves the subrequest budget, this is.
     asked.clear()
+    VW.S._call = lambda path, method="GET", body=None, prefer=None: []
     VW.fetch_candidates, VW._patch, EV.verify_batch = fake_fetch, fake_patch, fake_verify
     EV.BASE, EV.API_KEY = "https://fake", "k"
     VW.S.configured = lambda: True
@@ -112,6 +118,7 @@ def main():
     finally:
         (VW.fetch_candidates, VW._patch, EV.verify_batch, EV.BASE, EV.API_KEY,
          VW.S.configured) = real
+        VW.S._call = real_call
     check("  a second pass after settlement asks the verifier nothing",
           again["verified"] == 0 and not asked, "asked %d" % len(asked))
 

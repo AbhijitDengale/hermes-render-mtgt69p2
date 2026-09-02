@@ -236,9 +236,15 @@ def main():
           not VW.due_for_verification(lead("a@b.com", is_active=False), NOW))
 
     print("\n--- Structurally impossible addresses (real service shapes) ---")
-    res = VW.reject_unusable(lead(""), NOW)
-    check("an empty address is rejected without an API call",
-          res["decision"] == "reject" and res["record"]["reason"] == "missing_email")
+    # A missing address is NOT invalid. It is parked for manual contact by
+    # the worker and never reaches reject_unusable; what does reach it is a
+    # non-blank address that cannot be an email at all.
+    check("an empty address is not a rejection (it is parked, not invalid)",
+          not VW.due_for_verification(lead(""), NOW)
+          and VW.claim_guard(lead(""))[1].startswith("NO_EMAIL"))
+    res = VW.reject_unusable(lead("not-an-address"), NOW)
+    check("a non-blank address with no @ is rejected without an API call",
+          res["decision"] == "reject" and res["record"]["reason"] == "missing_at_sign")
     check("  and it is recorded as invalid",
           res["fields"]["email_verification_status"] == "invalid")
 
