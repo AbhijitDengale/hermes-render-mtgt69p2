@@ -27,12 +27,13 @@ import os
 import sys
 import urllib.error
 import urllib.request
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import followups as F  # noqa: E402
 import pipeline as P   # noqa: E402
+import tenants        # noqa: E402
 
 ROLE = os.getenv("AGENCY_ROLE", "").strip().lower()
 MAILHUB_BASE = os.getenv("MAILHUB_BASE_URL", "").rstrip("/")
@@ -106,12 +107,14 @@ def _assignment(lead_id: str) -> Dict[str, Any]:
         return out
 
 
-def _mailhub(path: str, body: Dict[str, Any]) -> Dict[str, Any]:
-    if not MAILHUB_BASE or not MAILHUB_TOKEN:
+def _mailhub(path: str, body: Dict[str, Any],
+             token: Optional[str] = None) -> Dict[str, Any]:
+    tok = token or MAILHUB_TOKEN
+    if not MAILHUB_BASE or not tok:
         return {"error": "MailHub is not configured for this profile"}
     req = urllib.request.Request(
         MAILHUB_BASE + path, data=json.dumps(body).encode(), method="POST")
-    req.add_header("Authorization", "Bearer " + MAILHUB_TOKEN)
+    req.add_header("Authorization", "Bearer " + tok)
     req.add_header("Content-Type", "application/json")
     try:
         with urllib.request.urlopen(req, timeout=45) as r:
@@ -238,12 +241,20 @@ def t_submit_verdict(a: Dict[str, Any]) -> Dict[str, Any]:
         # Approving must review the text that is actually stored. Accepting a
         # subject/body from the caller would let a rewritten message be
         # approved against a hash nobody checked.
+        # Approve inside the tenant that will send this lead. An approval is
+        # matched on (owner_user_id, content_hash), so one filed anywhere else
+        # simply is not found and the message stalls unsent.
+        approve_tok = tenants.approve_token(lead_id)
+        if not approve_tok:
+            return {"error": "no approve credential for this lead's MailHub "
+                             "tenant; refusing to approve rather than file it "
+                             "where the send path will not look"}
         res = _mailhub("/api/v1/approvals", {
             "subject": draft["subject"], "body_text": draft["body"],
             "qa_status": "approved", "qa_agent": "sentinel",
             "qa_reason": (a.get("reason") or "")[:500],
             "lead_id": lead_id, "campaign_id": lead.get("campaign_id"),
-        })
+        }, token=approve_tok)
         if res.get("error"):
             return {"error": "MailHub refused the approval", "detail": res}
         with P.writing(con):
@@ -388,10 +399,14 @@ def t_submit_classification(a: Dict[str, Any]) -> Dict[str, Any]:
         if cls == "unsubscribe" and r["from_email"]:
             # An opt-out has to reach MailHub's suppression list, not just our
             # own state. LEO holds a suppress-scoped credential and no other.
+            # Suppression is per tenant in MailHub, so an opt-out has to be
+            # recorded in the tenant that would otherwise send the next
+            # follow-up -- filing it elsewhere leaves this person mailable.
             suppressed = _mailhub("/api/v1/suppression",
                                   {"email": r["from_email"],
                                    "reason": "unsubscribed",
-                                   "detail": "LEO reply %d" % reply_id})
+                                   "detail": "LEO reply %d" % reply_id},
+                                  token=tenants.queue_token(lead_id))
 
         if requires_human:
             with P.writing(con):

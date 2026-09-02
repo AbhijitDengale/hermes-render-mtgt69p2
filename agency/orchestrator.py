@@ -32,6 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import followups as F  # noqa: E402
 import pipeline as P   # noqa: E402
+import tenants        # noqa: E402
 
 HERMES = os.getenv("HERMES_BIN", "/opt/hermes/.venv/bin/hermes")
 MAILHUB_BASE = os.getenv("MAILHUB_BASE_URL", "").rstrip("/")
@@ -46,13 +47,22 @@ MIN_OBSERVATIONS = int(os.getenv("AGENCY_MIN_OBSERVATIONS", "1"))
 # --- MailHub ----------------------------------------------------------------
 
 def mailhub(method: str, path: str,
-            body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    if not MAILHUB_BASE or not MAILHUB_TOKEN:
+            body: Optional[Dict[str, Any]] = None,
+            token: Optional[str] = None) -> Dict[str, Any]:
+    """One MailHub call as one tenant.
+
+    The token is explicit because a message and its status live inside the
+    tenant that queued it: MailHub answers 404, not 403, when a key asks about
+    another tenant's message, so calling with the wrong one looks like the
+    message vanished rather than like an authorisation error.
+    """
+    tok = token or MAILHUB_TOKEN
+    if not MAILHUB_BASE or not tok:
         return {"error": "MailHub not configured"}
     req = urllib.request.Request(
         MAILHUB_BASE + path, method=method,
         data=json.dumps(body).encode() if body is not None else None)
-    req.add_header("Authorization", "Bearer " + MAILHUB_TOKEN)
+    req.add_header("Authorization", "Bearer " + tok)
     req.add_header("Content-Type", "application/json")
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
@@ -284,6 +294,16 @@ def queue_and_send(con, lead) -> Optional[str]:
     key = "lead:%s:%s:stage%d:%s" % (lead["id"], lead["campaign_id"],
                                      stage, draft["content_hash"][:16])
 
+    # The tenant owning this lead's sender mailbox. SENTINEL filed the approval
+    # under the same tenant, because both derive it from the lead id.
+    tok = tenants.queue_token(lead["id"])
+    if not tok:
+        with P.writing(con):
+            P.transition(con, lead["id"], "HUMAN_REVIEW", AGENT,
+                         "no MailHub tenant credential configured",
+                         expect="READY_TO_SEND")
+        return "READY_TO_SEND -> HUMAN_REVIEW (no tenant credential)"
+
     if not draft["mailhub_queue_id"]:
         res = mailhub("POST", "/api/v1/messages", {
             "to_email": lead["email"], "to_name": lead["contact_name"] or "",
@@ -291,7 +311,7 @@ def queue_and_send(con, lead) -> Optional[str]:
             "idempotency_key": key,
             "meta": {"lead_id": lead["id"], "campaign_id": lead["campaign_id"],
                      "stage": stage},
-        })
+        }, token=tok)
         if res.get("status") not in ("queued", "duplicate"):
             with P.writing(con):
                 con.execute("UPDATE leads SET last_error=?, error_count=error_count+1"
@@ -308,7 +328,8 @@ def queue_and_send(con, lead) -> Optional[str]:
             res.get("id"), res.get("status"))
 
     # Already queued — ask MailHub whether the provider took it.
-    status = mailhub("GET", "/api/v1/messages/%s" % draft["mailhub_queue_id"])
+    status = mailhub("GET", "/api/v1/messages/%s" % draft["mailhub_queue_id"],
+                     token=tok)
     st = status.get("status")
     if st in ("sent", "simulated"):
         with P.writing(con):
