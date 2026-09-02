@@ -6,8 +6,9 @@
 #   2. Runs the config patcher as the hermes user. The patcher is
 #      idempotent: it only INSERTs the Render MCP server and the
 #      skills.external_dirs entry; it never overwrites user edits.
-#   3. Exec's the upstream entrypoint chain with the original args
-#      (default CMD is `gateway run`).
+#   3. Exec's the upstream entrypoint dispatcher with the original args
+#      (default CMD is `gateway run`), which brings up s6 and then runs
+#      that CMD as the container's main program.
 #
 # The upstream entrypoint also chowns /opt/data and drops to the hermes
 # user via gosu for the gateway process. Our chown here is redundant in
@@ -38,6 +39,17 @@ else
   echo "[render-tools] warning: ${PATCHER} not found or not executable; skipping" >&2
 fi
 
-# Hand off to the upstream entrypoint. The upstream script handles
-# privilege drop, dashboard backgrounding, and the actual gateway exec.
-exec /opt/hermes/docker/entrypoint.sh "$@"
+# Hand off to the upstream entrypoint dispatcher, which delegates to
+# s6-overlay's /init and then runs the CMD through main-wrapper.sh.
+#
+# NOT docker/entrypoint.sh. That is now a compatibility shim which runs the
+# cont-init bootstrap and then returns WITHOUT exec'ing the CMD -- its own
+# warning says so. Against a newer base image it left the container with s6
+# up, every service registered, and no main program, so s6-overlay began
+# shutting straight back down; whether the gateway happened to start before
+# that sweep reached it was a race. It lost that race once for eighteen hours.
+#
+# `exec` matters: this script is PID 1, and the dispatcher only delegates to
+# /init when it is PID 1 itself. Losing that would silently drop the container
+# to the unsupervised fallback path, where the dashboard service does not exist.
+exec /opt/hermes/docker/entrypoint-dispatch.sh "$@"

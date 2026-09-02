@@ -84,6 +84,18 @@ RUN install -d -o hermes -g hermes -m 0755 /opt/data
 
 # Stay as root so the bootstrap can chown the mounted /opt/data on first
 # boot, then `gosu hermes` for the config patch, then exec the upstream
-# entrypoint (which also runs as root and does its own gosu drop).
-ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/opt/render-tools/bootstrap.sh"]
+# entrypoint dispatcher (which also runs as root and does its own drop).
+#
+# No tini. /usr/bin/tini in this image is not tini -- it is a shim whose
+# fallback branch is `exec /init main-wrapper.sh "$@"`, so the real tini flags
+# we used to pass (`-g --`) were forwarded verbatim to main-wrapper.sh, which
+# has no way to interpret them. The main program then died immediately, and a
+# container whose main program has exited is a container s6-overlay starts
+# shutting down -- which is how this image ended up sitting in a hung
+# `s6-rc -bda change` with no gateway. s6-overlay's own /init is PID 1 here and
+# does the signal handling and zombie reaping tini would have provided.
+#
+# bootstrap.sh must therefore be exec'd directly, so that it inherits PID 1 and
+# its own exec keeps it.
+ENTRYPOINT ["/opt/render-tools/bootstrap.sh"]
 CMD ["gateway", "run"]

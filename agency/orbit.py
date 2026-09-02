@@ -23,6 +23,7 @@ ORBIT never writes. It may recommend pausing a sender; it will not do it.
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import os
 import sys
@@ -82,6 +83,73 @@ def mailhub(path: str) -> Dict[str, Any]:
         return {"error": "http %d" % e.code}
     except Exception as exc:
         return {"error": "%s: %s" % (type(exc).__name__, exc)}
+
+
+# How long each job may go unrun before it is worth saying so. Generous
+# multiples of the schedule, because a single missed tick is noise and a job
+# that has been silent for an hour is not.
+CRON_STALE_MINUTES = {
+    "maya-orchestrator": 30,
+    "leo-inbound": 30,
+    "echo-followups": 30,
+    "supabase-lead-sync": 60,
+    "review-alerts": 60,
+    "orbit-daily": 60 * 26,
+}
+CRON_JOBS_PATH = os.getenv("HERMES_CRON_JOBS", "/opt/data/cron/jobs.json")
+
+
+def automation_health(now=None) -> Dict[str, Any]:
+    """Which scheduled jobs have actually run, from the cron store itself.
+
+    Read from timestamps rather than inferred: the failure this exists to catch
+    is the gateway being down, and a stopped gateway leaves every other signal
+    looking exactly like a quiet day. Eighteen hours of that went unnoticed
+    once, so silence is now reported as a fault rather than as nothing.
+    """
+    out: Dict[str, Any] = {"jobs": [], "stale": [], "never_ran": [],
+                           "error": None}
+    try:
+        raw = json.load(open(CRON_JOBS_PATH, encoding="utf-8"))
+    except Exception as exc:
+        out["error"] = "%s: %s" % (type(exc).__name__, exc)
+        return out
+    jobs = raw if isinstance(raw, list) else raw.get("jobs", raw)
+    seq = [x for x in (list(jobs.values()) if isinstance(jobs, dict) else jobs)
+           if isinstance(x, dict)]
+
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    for job in sorted(seq, key=lambda j: j.get("name") or ""):
+        name = job.get("name") or "?"
+        last = job.get("last_run_at")
+        age_min = None
+        if last:
+            try:
+                t = datetime.datetime.fromisoformat(last)
+                if t.tzinfo is None:
+                    t = t.replace(tzinfo=datetime.timezone.utc)
+                age_min = int((now - t).total_seconds() // 60)
+            except Exception:
+                age_min = None
+        entry = {"name": name, "id": job.get("id"),
+                 "schedule": job.get("schedule_display"),
+                 "last_run_at": last, "age_minutes": age_min,
+                 "status": job.get("last_status"),
+                 "runs": (job.get("repeat") or {}).get("completed")}
+        limit = CRON_STALE_MINUTES.get(name)
+        if last is None:
+            out["never_ran"].append(name)
+            entry["stale"] = True
+        elif limit is not None and age_min is not None and age_min > limit:
+            out["stale"].append(name)
+            entry["stale"] = True
+        else:
+            entry["stale"] = False
+        out["jobs"].append(entry)
+
+    names = [j.get("name") for j in seq]
+    out["duplicates"] = sorted({n for n in names if names.count(n) > 1})
+    return out
 
 
 def collect(db: str = None) -> Dict[str, Any]:
@@ -241,6 +309,8 @@ def collect(db: str = None) -> Dict[str, Any]:
         m["research"] = RM.collect(db)
     except Exception as exc:
         m["research_error"] = "%s: %s" % (type(exc).__name__, exc)
+
+    m["automation"] = automation_health()
 
     # --- capacity across every tenant --------------------------------------
     # ORBIT holds a read-only key for one tenant, so /api/v1/accounts shows it
@@ -483,6 +553,34 @@ def report(m: Dict[str, Any]) -> str:
                         else "NOT ready (missing: %s)" % ", ".join(missing)))
         L.append("  Total configured capacity:  %d/day" % (m.get("capacity_configured") or 0))
         L.append("  Currently usable capacity:  %d/day" % (m.get("capacity_usable") or 0))
+    L.append("")
+
+    # ---- AUTOMATION ------------------------------------------------------
+    a = m.get("automation") or {}
+    L.append("**AUTOMATION**")
+    if a.get("error"):
+        L.append("  cron store unreadable: %s" % a["error"])
+    elif not a.get("jobs"):
+        L.append("  no scheduled jobs found")
+    else:
+        for j in a["jobs"]:
+            age = ("%dm ago" % j["age_minutes"]) if j["age_minutes"] is not None \
+                else "never"
+            L.append("    %-20s %-11s last run %-12s %s%s"
+                     % (j["name"], j["schedule"] or "-", age,
+                        j["status"] or "-",
+                        "   <-- STALE" if j["stale"] else ""))
+        if a.get("never_ran"):
+            L.append("  NEVER RUN: %s" % ", ".join(a["never_ran"]))
+        if a.get("stale"):
+            L.append("  STALE — these have not run recently: %s"
+                     % ", ".join(a["stale"]))
+            L.append("  A stalled scheduler looks exactly like a quiet day in "
+                     "every other number above. Check the gateway is running.")
+        if a.get("duplicates"):
+            L.append("  DUPLICATE JOB NAMES: %s" % ", ".join(a["duplicates"]))
+        if not a.get("stale") and not a.get("never_ran"):
+            L.append("  All scheduled jobs have run recently.")
     L.append("")
 
     # ---- PIPELINE --------------------------------------------------------
