@@ -39,6 +39,7 @@ from typing import Any, Dict, List, Optional
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import followups as F  # noqa: E402
+import delivery_status as DS
 import pipeline as P
 import tenants   # noqa: E402
 
@@ -140,6 +141,70 @@ def _mirror(con, lead_id: str, event: str, payload: dict) -> None:
         pass
 
 
+def _handle_permanent_bounce(con, lead, ev, reply_id, verdict, cancelled):
+    """A proven dead address: record it, suppress that one address, stop.
+
+    The order matters and is the order the follow-ups were already cancelled
+    in above: nothing here can run before the scheduled mail is stopped.
+
+    Exactly one address is suppressed -- the one the reporting server named as
+    having failed. Not the domain, and not whatever address appears first in a
+    bounce body, which is frequently our own sender.
+    """
+    recipient = verdict["recipient"]
+    with P.writing(con):
+        con.execute("UPDATE inbound_replies SET classification='hard_bounce',"
+                    "       confidence=?, summary=?, requires_human=0,"
+                    "       recommended_action=?, draft_reply=NULL,"
+                    "       classified_at=datetime('now') WHERE id=?",
+                    (verdict["confidence"],
+                     ("Delivery to %s failed permanently: %s"
+                      % (recipient, verdict.get("reason") or verdict["code"]))[:1000],
+                     "; ".join(DS.recommended_actions(verdict))[:500], reply_id))
+        try:
+            P.transition(con, lead["id"], "BOUNCED", "inbound",
+                         "permanent delivery failure (%s)" % verdict["code"])
+        except P.TransitionError:
+            pass                       # already BOUNCED, or somewhere final
+
+    # Suppression is per tenant in MailHub: filing it under the wrong tenant
+    # leaves this person mailable by the mailbox that would actually write to
+    # them next. LEO's credential is the one carrying the suppress scope.
+    suppressed = None
+    rt = ev.get("tenant_user_id")
+    tenant = tenants.by_user_id(int(rt)) if rt is not None else None
+    token = (tenant or {}).get("leo")
+    if not token:
+        suppressed = {"error": "no LEO suppress credential for this tenant"}
+    else:
+        suppressed = mailhub("POST", "/api/v1/suppression",
+                             {"email": recipient, "reason": "bounced",
+                              "detail": "permanent delivery failure %s"
+                                        % verdict["code"]}, token=token)
+
+    _mirror(con, lead["id"], "reply_received", {
+        "tenant_user_id": rt,
+        "provider_message_id": ev.get("provider_message_id"),
+        "is_bounce": True, "is_auto_reply": False,
+        "followups_cancelled": cancelled, "state": "BOUNCED",
+    })
+    _mirror(con, lead["id"], "bounced", {
+        "recipient": recipient, "code": verdict["code"],
+        "reason": (verdict.get("reason") or "")[:300],
+    })
+    # Fully handled, so it is consumed. Leaving it would have MailHub return
+    # the same bounce on every poll; the UNIQUE on provider_message_id would
+    # discard it each time, but only after fetching it again.
+    if ev.get("inbound_id"):
+        mailhub("POST", "/api/v1/inbound/%s/consume" % ev["inbound_id"],
+                token=ev.get("_token"))
+    return ("reply %d: permanent bounce for %s (%s); %d follow-up(s) cancelled, "
+            "address suppressed%s - no human review needed"
+            % (reply_id, recipient, verdict["code"], cancelled,
+               "" if not (suppressed or {}).get("error")
+               else " FAILED: " + suppressed["error"]))
+
+
 def process_one(con, ev: Dict[str, Any]) -> str:
     lead_id = ev.get("lead_id")
 
@@ -179,14 +244,38 @@ def process_one(con, ev: Dict[str, Any]) -> str:
         except P.TransitionError as exc:
             moved = "not moved (%s)" % exc
 
-    # --- 3. only now, ask LEO what it means ---------------------------------
+    # --- 3. a delivery report answers itself --------------------------------
+    # A bounce is a machine-generated report with the answer written in it as
+    # an RFC 3463 code. Handing that to a model produced the thing this
+    # replaces: every bounce arriving for a person to read, labelled
+    # "unclear", while the address that failed stayed mailable.
+    #
+    # Only a permanent failure whose code the reporting server generated, and
+    # whose failed recipient the report names, is acted on without a person.
+    # A relay refusal, a full mailbox, a temporary defer and an unparsable
+    # bounce all fall through to the ordinary path.
+    verdict = DS.classify(ev.get("from_email") or "", ev.get("subject") or "",
+                          ev.get("body_text") or "", lead["email"])
+    if DS.may_suppress(verdict):
+        return _handle_permanent_bounce(con, lead, ev, reply_id, verdict, n)
+    if verdict["status"] != DS.NOT_A_BOUNCE:
+        # Still a delivery failure, just not one we may act on alone. Record
+        # what it is so the card can say so instead of guessing.
+        with P.writing(con):
+            con.execute("UPDATE inbound_replies SET classification=?,"
+                        "       confidence=?, summary=?, requires_human=1,"
+                        "       classified_at=datetime('now') WHERE id=?",
+                        (verdict["status"].lower(), verdict["confidence"],
+                         (verdict.get("reason") or "")[:1000], reply_id))
+
+    # --- 4. otherwise, ask LEO what it means --------------------------------
     task = dispatch_leo(lead_id, reply_id)
     if task:
         with P.writing(con):
             con.execute("UPDATE inbound_replies SET leo_task_id=? WHERE id=?",
                         (task, reply_id))
 
-    # --- 4. mirror the outcome ---------------------------------------------
+    # --- 5. mirror the outcome ---------------------------------------------
     # Queued, not written through: the reply is already recorded and the
     # follow-ups already cancelled, so a Supabase outage is a retry rather
     # than a reason to reprocess a reply that was handled correctly here.
@@ -199,7 +288,7 @@ def process_one(con, ev: Dict[str, Any]) -> str:
         "state": moved,
     })
 
-    # --- 5. consume, but only what was actually handled ---------------------
+    # --- 6. consume, but only what was actually handled ---------------------
     # If LEO could not be dispatched, the reply has been recorded and its
     # follow-ups cancelled -- the protective half is done -- but nothing has
     # classified it yet. Leaving it unconsumed lets the next tick try again;
