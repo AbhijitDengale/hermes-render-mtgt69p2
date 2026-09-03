@@ -398,6 +398,11 @@ def collect(db: str = None) -> Dict[str, Any]:
                 "daily_limit": a.get("daily_limit"),
                 "sent_total": a.get("sent_total"),
                 "consecutive_errors": a.get("consecutive_errors"),
+                # The identity the mailbox sends as, exactly as MailHub reports
+                # it. Presentation reads these; nothing is derived from them.
+                "from_email": a.get("from_email"),
+                "from_name": a.get("from_name"),
+                "identity_status": a.get("identity_status"),
             }
             m["senders"].append(entry)
             # Observations only. ORBIT does not change sender configuration.

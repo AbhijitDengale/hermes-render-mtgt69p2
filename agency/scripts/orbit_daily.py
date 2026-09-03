@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""ORBIT's daily report. Hermes cron, --no-agent --deliver discord.
+"""ORBIT's daily report. Hermes cron, --no-agent, delivered locally.
+
+The report reaches Discord from here, as embed cards (orbit_embeds), not
+through the cron's own delivery: that path wraps stdout in a "Cronjob
+Response" header and posts one wall of text, which is exactly what the cards
+replace. The job therefore delivers to local, so its log keeps the plaintext
+report and the delivery summary, and nothing but the cards reaches the
+channel.
 
 Runs from the root profile because that is the one with Discord configured,
 but reads ORBIT's own read-only MailHub credential from ORBIT's profile
@@ -31,38 +38,44 @@ os.environ.setdefault("AGENCY_DB", "/opt/data/agency.db")
 
 import orbit  # noqa: E402
 
-print(orbit.report(orbit.collect()))
+metrics = orbit.collect()
+# The plaintext report stays in the cron's local log: same numbers, same
+# order, useful when someone reads the history without Discord.
+print(orbit.report(metrics))
 
-# The complete no-email list goes out as its own multi-part Discord delivery,
-# after the summary above has been handed to the cron's own delivery. It is
-# posted from here rather than printed because a list of several hundred
-# leads is dozens of messages, each of which must be tracked so a failure can
-# resume without resending what already landed.
-#
-# The Discord token is read from the root env this job already runs in and is
-# never printed. A failure here is reported on stdout (which the cron
-# delivers) and never raises, so the summary is not lost with it.
+# Cards to Discord, resumably. The Discord token is read from the root env
+# this job already runs in and is never printed. A failure here is reported on
+# stdout and never raises, so the log above is not lost with it.
 try:
     for line in open("/opt/data/.env", encoding="utf-8"):
         key, sep, value = line.partition("=")
         if sep and key.strip() in ("DISCORD_BOT_TOKEN", "SUPABASE_URL",
-                                   "SUPABASE_SECRET_KEY", "NO_EMAIL_DISCORD_CHANNEL"):
+                                   "SUPABASE_SECRET_KEY", "NO_EMAIL_DISCORD_CHANNEL",
+                                   "ORBIT_REPORT_DISCORD_CHANNEL"):
             os.environ.setdefault(key.strip(), value.strip())
     import no_email_report as NE
+    import orbit_embeds as OE
     import pipeline as P
     import supabase_sync as S
     _day = S.operational_day()
     _built = NE.build(_day)
-    with P.connect() as _con:
-        _res = NE.post_all(_con, _built)
-    _stamped = NE.mark_reported(_built["leads"], _day) if _res["failed"] == 0 else 0
-    print("")
-    print("NO EMAIL LEADS delivery: %d part(s) sent, %d already delivered, "
-          "%d failed of %d; %d lead(s) stamped as reported"
-          % (_res["sent"], _res["skipped"], _res["failed"], _res["parts"], _stamped))
-    if _res["failed"]:
-        print("  delivery incomplete; the next run resumes from the first "
-              "undelivered part without resending what landed")
+    _messages = OE.build_messages(metrics, _built, OE.sender_identities(m=metrics))
+    _problems = OE.validate(_messages)
+    if _problems:
+        print("")
+        print("DISCORD CARDS: not sent, payload outside Discord limits: %s"
+              % "; ".join(_problems)[:400])
+    else:
+        with P.connect() as _con:
+            _res = OE.post_all(_con, _messages, _day)
+        _stamped = NE.mark_reported(_built["leads"], _day) if _res["failed"] == 0 else 0
+        print("")
+        print("DISCORD CARDS: %d message(s) sent, %d already delivered, %d failed of %d; "
+              "%d no-email lead(s) stamped as reported"
+              % (_res["sent"], _res["skipped"], _res["failed"], _res["parts"], _stamped))
+        if _res["failed"]:
+            print("  delivery incomplete; the next run resumes from the first "
+                  "undelivered message without resending what landed")
 except Exception as _exc:
     print("")
-    print("NO EMAIL LEADS delivery failed: %s: %s" % (type(_exc).__name__, _exc))
+    print("DISCORD CARDS delivery failed: %s: %s" % (type(_exc).__name__, _exc))

@@ -61,12 +61,15 @@ CRON_JOBS = {
                            "supabase_lead_sync.py", "local"),
     "review-alerts": (HERMES_HOME, "every 2m", "review_alerts.py",
                       discord(ALERTS_CHANNEL)),
-    "orbit-daily": (HERMES_HOME, "0 8 * * *", "orbit_daily.py",
-                    discord(REPORT_CHANNEL)),
+    # Delivered locally on purpose: the script posts the report itself as
+    # Discord embed cards (orbit_embeds). Letting the cron deliver stdout would
+    # post the plaintext a second time, wrapped in a "Cronjob Response" header.
+    "orbit-daily": (HERMES_HOME, "0 8 * * *", "orbit_daily.py", "local"),
 }
-# Both Discord jobs run from the root profile deliberately: Discord is
+# The alerts job runs from the root profile deliberately: Discord is
 # configured there and nowhere else, so a job scheduled on a sub-profile
-# executes fine and then fails to deliver.
+# executes fine and then fails to deliver. ORBIT runs there for the same
+# reason: the bot token it posts with lives in the root env.
 
 # Cron wrappers: repo path -> where the profile expects to find it.
 WRAPPERS = {
@@ -79,7 +82,8 @@ WRAPPERS = {
 
 MODULES = ("pipeline.py", "lead_ingest.py", "orchestrator.py", "followups.py",
            "inbound_processor.py", "echo_tick.py", "review.py",
-           "review_tick.py", "orbit.py", "agency_mcp.py", "research_mcp.py",
+           "review_tick.py", "orbit.py", "orbit_embeds.py", "agency_mcp.py",
+           "research_mcp.py",
            "research_metrics.py", "supabase_sync.py",
            "schema.sql", "seed_state_transitions.sql")
 
