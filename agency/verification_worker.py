@@ -96,20 +96,49 @@ def due_for_verification(lead: Dict[str, Any],
     return now >= when
 
 
+CANDIDATE_COLS = ("id,email,status,is_active,hermes_status,"
+                  "email_verification_status,email_verified,raw_data,updated_at")
+
+# A verdict of valid, invalid or risky is final; only these two mean the
+# verifier still has work to do on the address as it stands.
+NEEDS_VERDICT = ("email_verification_status.is.null,"
+                 "email_verification_status.eq.unknown")
+
+
+def _candidates(extra: str, limit: int) -> List[Dict[str, Any]]:
+    if limit <= 0:
+        return []
+    q = ("leads?select=%s&is_active=eq.true&email=not.is.null&email=neq.%s"
+         "&order=updated_at.asc&limit=%d" % (CANDIDATE_COLS, extra, limit))
+    return [r for r in (S._call(q) or []) if isinstance(r, dict)]
+
+
 def fetch_candidates(limit: int = 200) -> List[Dict[str, Any]]:
     """Leads that plausibly need verification, narrowed further in Python.
 
+    Rows with no verdict yet, or a non-final one, are fetched FIRST and always.
+    They are the only rows that can actually change state, and taking them
+    first is what keeps the worker making progress.
+
+    One generous scan ordered by updated_at used to be the whole selection.
+    That starved: every already-final row still matched the filter, and once
+    there were more of them than the scan limit they filled the window
+    permanently. The verifier then read the same 200 finished rows every two
+    minutes and verified nothing, while hundreds of leads that had never been
+    checked sat just past the end of the window and never entered outreach.
+
+    Whatever budget is left over still goes to the generous scan, because
     PostgREST cannot express "the stored verdict was for a different address"
-    across two columns, so the coarse filter runs in the database and the exact
-    one runs here. The coarse filter is deliberately generous: missing a lead
-    costs a delay, and the fine filter is cheap.
+    across two columns and that check has to see final rows to catch an email
+    edited after verification.
     """
-    cols = ("id,email,status,is_active,hermes_status,email_verification_status,"
-            "email_verified,raw_data,updated_at")
-    q = ("leads?select=%s&is_active=eq.true&email=not.is.null&email=neq."
-         "&order=updated_at.asc&limit=%d" % (cols, limit))
-    rows = S._call(q) or []
-    return [r for r in rows if isinstance(r, dict)]
+    rows = _candidates("&or=(%s)" % NEEDS_VERDICT, limit)
+    seen = {r.get("id") for r in rows}
+    for r in _candidates("", max(0, limit - len(rows))):
+        if r.get("id") not in seen:
+            seen.add(r.get("id"))
+            rows.append(r)
+    return rows
 
 
 def _patch(lead_id: str, fields: Dict[str, Any]) -> None:

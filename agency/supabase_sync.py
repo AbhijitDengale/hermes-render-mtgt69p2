@@ -260,6 +260,42 @@ def _verification_allows(sid, verdicts):
         return False, "verification check failed: %s" % _sanitize(str(exc))
 
 
+def _count(query: str) -> int:
+    """Exact row count from PostgREST's Content-Range header.
+
+    A plain select returns at most one page, so len() of it is a page size and
+    not a count once the table is larger than the page. This asks the database
+    for the number instead.
+    """
+    if not configured():
+        raise SupabaseError("SUPABASE_URL / SUPABASE_SECRET_KEY are not set")
+    req = urllib.request.Request(
+        SUPABASE_URL + "/rest/v1/" + query + "&select=id&limit=1", method="GET")
+    req.add_header("apikey", SUPABASE_SECRET)
+    req.add_header("Authorization", "Bearer " + SUPABASE_SECRET)
+    req.add_header("Prefer", "count=exact")
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+            cr = r.headers.get("Content-Range", "")
+    except urllib.error.HTTPError as exc:
+        raise SupabaseError("http %d: %s" % (exc.code, _sanitize(
+            exc.read().decode()[:300])))
+    except Exception as exc:
+        raise SupabaseError("%s: %s" % (type(exc).__name__, _sanitize(str(exc))))
+    return int(cr.split("/")[-1]) if "/" in cr else 0
+
+
+def _eligible_count() -> int:
+    """How many leads satisfy the full admission contract right now."""
+    import verification_worker as VW
+    return _count("leads?is_active=eq.true&" + VW.claimable_filter())
+
+
+def _ready_unimported_count() -> int:
+    return _count("leads?is_active=eq.true&status=eq.ready"
+                  "&hermes_status=eq.not_imported")
+
+
 def claim(limit: int = None, campaign: str = "C-LEADSKING",
           dry_run: bool = False) -> Dict[str, Any]:
     """Claim ready leads and import them. Atomic on the Supabase side.
@@ -292,6 +328,24 @@ def claim(limit: int = None, campaign: str = "C-LEADSKING",
     # claim_verified_leads_for_hermes() exists in Supabase (see
     # migrations/supabase/009_email_verification_gate.sql), switching to it is
     # one env var. The Python guard below stays on either way.
+    # Nothing eligible means nothing to claim. Without this the tick claims a
+    # window of unverified rows, the guard releases every one of them, and the
+    # next tick claims the same window again -- churn that writes to Supabase
+    # twice a minute, hides a stalled verifier behind "claimed 20", and can
+    # keep an eligible row that sorts behind them permanently out of reach.
+    try:
+        eligible = _eligible_count()
+    except Exception as exc:
+        eligible = None
+        out["eligible_check_error"] = str(exc)[:200]
+    out["eligible"] = eligible
+    if eligible == 0:
+        out["skipped"] = ("no verified-ready leads to claim: %d lead(s) are "
+                          "ready and unimported but none has a valid "
+                          "verification verdict for its current address"
+                          % _ready_unimported_count())
+        return out
+
     rows = rpc(CLAIM_RPC, {"p_limit": limit}) or []
     out["claimed"] = len(rows)
     out["unverified"] = 0
