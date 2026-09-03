@@ -23,6 +23,7 @@ import json
 from typing import Any, Dict, List, Optional, Tuple
 
 import email_verifier as EV
+import role_account_policy as RAP
 import supabase_sync as S
 
 RAW_KEY = "email_verification"
@@ -176,6 +177,28 @@ def apply_result(lead: Dict[str, Any], result: Dict[str, Any],
     attempts = 1 if EV.stale(prev, result["email"]) else prev_attempts + 1
 
     record = EV.verification_record(result, attempts, _iso(now))
+
+    # Role-account policy, applied on top of the verifier's verdict and only
+    # where role_account is the whole of its objection. A published front-door
+    # mailbox on a domain that passed every technical check is eligible for
+    # B2B outreach; an internal function is held; an automated or
+    # recruitment address is refused. Nothing else in the verdict is touched,
+    # and any other finding still wins -- see role_account_policy.
+    if RAP.sole_reason_is_role(record):
+        verdict = RAP.evaluate(result["email"], record,
+                               bounced=bool(lead.get("bounced_at")),
+                               suppressed=bool(lead.get("suppressed")),
+                               unsubscribed=(lead.get("status") == "unsubscribed"
+                                             or bool(lead.get("unsubscribed_at"))))
+        if verdict["status"] and verdict["status"] != record["status"]:
+            record["policy"] = RAP.audit_entry(record, verdict, _iso(now))
+            record["status"] = verdict["status"]
+            record["reason"] = verdict["reason"]
+            record["decision"] = EV.ADMISSION.get(verdict["status"], "hold")
+        elif verdict["status"]:
+            record["policy"] = RAP.audit_entry(record, verdict, _iso(now))
+            record["reason"] = verdict["reason"]
+
     decision = record["decision"]
 
     fields: Dict[str, Any] = {
