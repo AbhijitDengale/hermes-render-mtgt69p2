@@ -28,9 +28,17 @@ BASE = (os.getenv("MAILHUB_BASE_URL", "") or "").rstrip("/")
 TIMEOUT = int(os.getenv("MAILHUB_HEALTH_TIMEOUT", "30"))
 
 
+# Enough to hold a full accounts listing without being unbounded. This is a
+# parse budget, not a log budget: it was once 400 characters, which silently
+# truncated the JSON for any mailbox that had sent enough to fill in its
+# timestamps, so the listing failed to parse and a healthy tenant was recorded
+# as having no usable mailbox.
+MAX_BODY = int(os.getenv("MAILHUB_HEALTH_MAX_BODY", "200000"))
+
+
 def _call(token: str, method: str, path: str,
           body: Optional[Dict[str, Any]] = None) -> Tuple[int, str]:
-    """Status code and a short body. Never raises, never logs the token."""
+    """Status code and the response body. Never raises, never logs the token."""
     if not BASE or not token:
         return 0, "not configured"
     req = urllib.request.Request(
@@ -40,9 +48,9 @@ def _call(token: str, method: str, path: str,
     req.add_header("Content-Type", "application/json")
     try:
         with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-            return r.status, r.read().decode()[:400]
+            return r.status, r.read().decode()[:MAX_BODY]
     except urllib.error.HTTPError as e:
-        return e.code, e.read().decode()[:400]
+        return e.code, e.read().decode()[:MAX_BODY]
     except Exception as exc:
         return 0, "%s: %s" % (type(exc).__name__, exc)
 
@@ -95,16 +103,26 @@ def check_queue(con: sqlite3.Connection, t: Dict[str, Any]) -> Dict[str, Any]:
     mailbox_ok = bool(acct) and all(
         a.get("health") in ("healthy", "warming")
         and int(a.get("effective_daily_limit") or 0) > 0 for a in acct)
+    # A mailbox with no verified professional identity cannot send: MailHub
+    # refuses at dispatch and holds the message. Treating it as usable would
+    # route leads into a tenant that can only stall them, so the identity is
+    # part of mailbox_ok rather than a separate advisory field.
+    identity_ok = all(a.get("identity_status") == "verified" and a.get("from_email")
+                      for a in acct)
+    mailbox_ok = mailbox_ok and identity_ok
     first = acct[0] if acct else {}
     con.execute(
         "UPDATE tenant_health SET queue_ok=?, queue_checked_at=datetime('now'),"
         "  mailbox_ok=?, mailbox_email=?, daily_limit=?, sent_today=?,"
-        "  health=?, mailbox_checked_at=datetime('now')"
+        "  health=?, sender_from_email=?, sender_from_name=?,"
+        "  sender_identity_status=?, mailbox_checked_at=datetime('now')"
         " WHERE tenant_name=?",
         (1 if ok else 0, 1 if mailbox_ok else 0, first.get("email"),
          first.get("effective_daily_limit"), first.get("sent_today"),
-         first.get("health"), t["name"]))
+         first.get("health"), first.get("from_email"), first.get("from_name"),
+         first.get("identity_status"), t["name"]))
     return {"tenant": t["name"], "queue_ok": ok, "mailbox_ok": mailbox_ok,
+            "identity_ok": identity_ok, "sends_as": first.get("from_email"),
             "caps": caps, "mailboxes": len(acct)}
 
 

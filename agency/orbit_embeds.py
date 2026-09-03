@@ -234,6 +234,10 @@ def pack(embeds: List[Dict[str, Any]], per_message: int = EMBEDS_PER_MESSAGE,
 
 # --- sender identities: the names prospects see, never the transport --------
 
+def is_gmail(addr: str) -> bool:
+    return bool(_GMAIL_RE.fullmatch((addr or "").strip()))
+
+
 def sender_identities(db: Optional[str] = None,
                       m: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """{'by_user': {user_id: {'name','email'}}, 'by_transport': {gmail: email}}.
@@ -250,13 +254,21 @@ def sender_identities(db: Optional[str] = None,
     transport_of = {int(t["user_id"]): (t.get("mailbox_email") or "").lower()
                     for t in tenants if t.get("user_id") is not None}
 
+    # First and most authoritative: what the queue health check read straight
+    # from MailHub for this tenant's own mailbox.
+    for t in tenants:
+        uid = t.get("user_id")
+        addr = t.get("sender_from_email")
+        if uid is not None and addr and not is_gmail(addr):
+            by_user[int(uid)] = {"name": t.get("sender_from_name") or "", "email": addr}
+
     raw = os.getenv("ORBIT_SENDER_IDENTITIES", "").strip()
     if raw:
         try:
             for uid, ident in json.loads(raw).items():
                 name, email = parse_identity(ident)
-                if email and not _GMAIL_RE.fullmatch(email):
-                    by_user[int(uid)] = {"name": name, "email": email}
+                if email and not is_gmail(email):
+                    by_user.setdefault(int(uid), {"name": name, "email": email})
         except Exception:
             pass
 

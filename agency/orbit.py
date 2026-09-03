@@ -360,6 +360,7 @@ def collect(db: str = None) -> Dict[str, Any]:
             rows = tcon.execute(
                 "SELECT tenant_name, user_id, mailbox_email, health, daily_limit,"
                 "       sent_today, mailbox_ok, queue_ok, approve_ok, leo_ok,"
+                "       sender_from_email, sender_from_name, sender_identity_status,"
                 "       mailbox_checked_at"
                 "  FROM tenant_health ORDER BY tenant_name").fetchall()
     except Exception:
