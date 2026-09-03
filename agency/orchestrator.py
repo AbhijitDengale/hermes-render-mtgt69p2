@@ -482,11 +482,116 @@ HANDLERS = [
 ]
 
 
+def _status_from_any_tenant(queue_id: str, preferred: Optional[int]):
+    """Ask MailHub about one queued message, using a credential that can see it.
+
+    A message is visible only to the tenant that queued it -- any other key
+    gets a 404, not a 403. The tenant recorded on the message is tried first;
+    the rest are tried only because a few early rows were queued before the
+    tenant was recorded on them, and without that fallback those rows can
+    never be resolved.
+    """
+    order = []
+    if preferred is not None:
+        t = tenants.by_user_id(int(preferred))
+        if t and t.get("queue"):
+            order.append(t)
+    for t in tenants.load():
+        if t.get("queue") and t not in order:
+            order.append(t)
+    for t in order:
+        res = mailhub("GET", "/api/v1/messages/%s" % queue_id, token=t["queue"])
+        if res and not res.get("error") and res.get("status"):
+            return res, t
+    return None, None
+
+
+def reconcile_queued(con, limit: int = 50) -> List[str]:
+    """Correct messages the provider confirmed but Hermes still calls queued.
+
+    A send is recorded when the orchestrator polls the message it queued. If
+    the lead leaves READY_TO_SEND first -- a reply arriving in the same two
+    minutes moves it to REPLIED or HUMAN_REVIEW -- nothing polls that message
+    again and it stays 'queued' for ever, so the agency under-counts its own
+    sends and Supabase never learns the email went out.
+
+    This asks MailHub for the truth and writes it down. It reads only; it can
+    never send, re-send, or change a subject, body or approval. It touches
+    only rows still marked queued, so running it twice is the same as running
+    it once, and a message already recorded as sent is never revisited.
+
+    The lead's state is advanced only when it is still waiting to send. A lead
+    that has moved on moved on for a reason, and correcting the message it
+    already sent is not grounds for dragging it backwards.
+    """
+    log: List[str] = []
+    rows = con.execute(
+        "SELECT id, lead_id, campaign_id, mailhub_queue_id, tenant_user_id,"
+        "       followup_stage"
+        "  FROM messages WHERE status='queued' AND mailhub_queue_id IS NOT NULL"
+        " ORDER BY updated_at LIMIT ?", (limit,)).fetchall()
+    for row in rows:
+        status, tenant = _status_from_any_tenant(row["mailhub_queue_id"],
+                                                 row["tenant_user_id"])
+        if not status:
+            log.append("[%s] MailHub #%s not visible to any tenant credential"
+                       % (row["lead_id"], row["mailhub_queue_id"]))
+            continue
+        st = status.get("status")
+        if st not in ("sent", "simulated"):
+            continue                      # still pending, or already failed
+        if not status.get("provider_message_id") and st == "sent":
+            continue                      # sent without acknowledgement: leave it
+
+        sender_shown = ((status.get("from_name") or "").strip() + " <"
+                        + status["from_email"] + ">").strip() \
+            if status.get("from_email") else None
+        lead = con.execute("SELECT * FROM leads WHERE id=?",
+                           (row["lead_id"],)).fetchone()
+        state = lead["state"] if lead else None
+
+        with P.writing(con):
+            con.execute(
+                "UPDATE messages SET status=?, provider_message_id=?,"
+                "       provider_thread_id=?, mailhub_account_id=?,"
+                "       from_email=COALESCE(?, from_email),"
+                "       tenant_user_id=COALESCE(tenant_user_id, ?),"
+                "       sent_at=?, dry_run=?, updated_at=datetime('now')"
+                " WHERE id=? AND status='queued'",
+                (st, status.get("provider_message_id"),
+                 status.get("provider_thread_id"), status.get("account_id"),
+                 sender_shown, tenant["user_id"] if tenant else None,
+                 status.get("sent_at"), 1 if st == "simulated" else 0,
+                 row["id"]))
+            if state == "READY_TO_SEND":
+                P.transition(con, row["lead_id"], "SENT", AGENT,
+                             "reconciled: provider confirmed %s"
+                             % (status.get("provider_message_id") or st),
+                             expect="READY_TO_SEND")
+        _mirror(con, row["lead_id"], "sent",
+                {"sender": sender_shown,
+                 "provider_message_id": status.get("provider_message_id"),
+                 "provider_thread_id": status.get("provider_thread_id")})
+        log.append("[%s] reconciled MailHub #%s -> %s (provider %s)%s"
+                   % (row["lead_id"], row["mailhub_queue_id"], st,
+                      status.get("provider_message_id"),
+                      "" if state == "READY_TO_SEND"
+                      else "; lead left READY_TO_SEND (%s), state untouched" % state))
+    return log
+
+
 def tick(limit: int = 5, only: Optional[str] = None) -> List[str]:
     """One orchestration pass. Safe to run repeatedly and concurrently."""
     log: List[str] = []
     worker = "maya-%d" % os.getpid()
     with P.connect() as con:
+        # Before anything else: a message the provider confirmed while its lead
+        # was moving elsewhere is still marked queued. Cheap -- it reads only
+        # rows in that state, and there are normally none.
+        try:
+            log.extend(reconcile_queued(con))
+        except Exception as exc:
+            log.append("reconcile: %s: %s" % (type(exc).__name__, exc))
         for state, handler in HANDLERS:
             if only and state != only:
                 continue

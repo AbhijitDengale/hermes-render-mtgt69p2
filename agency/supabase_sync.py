@@ -99,6 +99,12 @@ REPLY_CLASS = {
 }
 
 
+def _utcnow() -> str:
+    """UTC, ISO-8601, second resolution: what the timestamp columns hold."""
+    return (datetime.datetime.now(datetime.timezone.utc)
+            .replace(microsecond=0).isoformat())
+
+
 class SupabaseError(RuntimeError):
     pass
 
@@ -534,6 +540,25 @@ def _deliver(event: sqlite3.Row) -> None:
                               "human_review")
         rpc("mark_lead_replied", {"p_hermes_lead_id": lead_id,
                                   "p_classification": cls})
+        return
+
+    if kind == "reply_received":
+        # A reply arrived and its follow-ups were cancelled. That is all this
+        # event asserts: the classification is LEO's and arrives separately as
+        # `replied`, so nothing here writes reply_status or
+        # reply_classification and an unclassified reply cannot be mistaken
+        # for a classified one.
+        #
+        # Each write is conditional on the column still being empty, which
+        # PostgREST applies as part of the UPDATE. Replaying the event is
+        # therefore a no-op rather than a rewrite of the arrival time, and the
+        # first reply on a lead keeps its timestamp.
+        when = payload.get("received_at") or _utcnow()
+        _call("leads?id=eq.%s&replied_at=is.null" % sid, "PATCH",
+              {"replied_at": when}, prefer="return=minimal")
+        if payload.get("is_bounce"):
+            _call("leads?id=eq.%s&bounced_at=is.null" % sid, "PATCH",
+                  {"bounced_at": when}, prefer="return=minimal")
         return
 
     if kind == "research":
