@@ -215,15 +215,32 @@ def main() -> int:
               "it only creates or reads kanban tasks")
 
         print("\n--- 14. Stranded leads are counted, not silently repaired ---")
-        found = O.stranded_leads(con)
-        check("14. a COPY_PENDING lead whose draft is gone is reported",
-              True, "%d reported from this fixture" % len(found))
         with P.writing(con):
             con.execute("INSERT INTO leads (id, campaign_id, email,"
                         " business_name, state) VALUES"
                         " ('L-y','C1','c@d.com','Co2','COPY_PENDING')")
-        check("    a lead with no draft at all counts as stranded",
-              "L-y" in O.stranded_leads(con), str(O.stranded_leads(con)))
+        real_tasks = O._task_statuses_by_lead
+        try:
+            # Missing output alone is not a strand. A lead waiting its turn in
+            # a backlog looks identical on that test alone, and counting those
+            # reported sixty strands on a pipeline that was draining perfectly.
+            O._task_statuses_by_lead = lambda ids: {}
+            check("14. a lead with no task on the board yet is backlog",
+                  "L-y" not in O.stranded_leads(con),
+                  "the stage simply has not been reached")
+            O._task_statuses_by_lead = lambda ids: {"L-y": ["running"]}
+            check("    a lead whose task is still running is not stranded",
+                  "L-y" not in O.stranded_leads(con))
+            O._task_statuses_by_lead = lambda ids: {"L-y": ["done", "done"]}
+            check("    output missing AND every task stopped is a strand",
+                  "L-y" in O.stranded_leads(con))
+            O._task_statuses_by_lead = lambda ids: {"L-x": ["done"],
+                                                    "L-y": ["done"]}
+            check("    a lead that HAS its output never counts",
+                  "L-x" not in O.stranded_leads(con),
+                  "L-x holds a queued message from the checks above")
+        finally:
+            O._task_statuses_by_lead = real_tasks
 
     print("\n--- 15. Board health reads real liveness evidence ---")
     h = O.board_health()

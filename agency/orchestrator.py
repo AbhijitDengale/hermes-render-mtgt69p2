@@ -769,12 +769,41 @@ def board_health() -> Dict[str, Any]:
     return out
 
 
-def stranded_leads(con, limit: int = 200) -> List[str]:
-    """Leads waiting on a stage whose output never arrived.
+def _task_statuses_by_lead(lead_ids) -> Dict[str, List[str]]:
+    """Every kanban task status for each lead, in one pass over the board."""
+    out: Dict[str, List[str]] = {}
+    if not lead_ids:
+        return out
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % _kanban_db_path(), uri=True)
+    except sqlite3.Error:
+        return out
+    try:
+        for key, status in con.execute(
+                "SELECT idempotency_key, status FROM tasks"
+                " WHERE idempotency_key LIKE 'agency:%'"):
+            # agency:<lead>:gen:<n>:<stage>
+            parts = (key or "").split(":")
+            if len(parts) > 1:
+                out.setdefault(parts[1], []).append((status or "").lower())
+    except sqlite3.Error:
+        pass
+    con.close()
+    return out
 
-    Reported, not repaired: dispatch() re-offers these on the ordinary tick.
-    A count that does not fall over successive ticks means the rescue budget
-    is spent and a person should look.
+
+def stranded_leads(con, limit: int = 400) -> List[str]:
+    """Leads whose stage output is missing AND whose every task has stopped.
+
+    Both halves are needed, and getting that wrong is easy: a lead sitting in
+    QA_PENDING with a draft and no verdict is the NORMAL waiting state, not a
+    fault, and counting those made this metric report sixty stranded leads on
+    a pipeline that was draining perfectly. What makes a lead stranded is that
+    nothing is left to produce the output -- every task it has is terminal --
+    which is the condition dispatch() re-offers on the next tick.
+
+    Reported, not repaired. A count that does not fall over successive ticks
+    means the rescue budget is spent and a person should look.
     """
     out = []
     try:
@@ -784,16 +813,20 @@ def stranded_leads(con, limit: int = 200) -> List[str]:
             " LIMIT ?", (limit,)).fetchall()
     except sqlite3.Error:
         return out
+    tasks = _task_statuses_by_lead([r["id"] for r in rows])
     for r in rows:
         lid, state = r["id"], r["state"]
         if state == "RESEARCHING":
-            if not P.load_research(con, lid):
-                out.append(lid)
+            missing = not P.load_research(con, lid)
+        else:
+            draft = P.load_draft(con, lid, r["followup_stage"] or 0)
+            missing = (not draft) if state == "COPY_PENDING"                 else (not draft or not draft["qa_status"])
+        if not missing:
             continue
-        draft = P.load_draft(con, lid, r["followup_stage"] or 0)
-        if state == "COPY_PENDING" and not draft:
-            out.append(lid)
-        elif state == "QA_PENDING" and (not draft or not draft["qa_status"]):
+        seen = tasks.get(lid) or []
+        # No task at all means the stage has not been dispatched yet, which is
+        # the tick's ordinary backlog, not a strand.
+        if seen and all(st in TERMINAL_TASK_STATUSES for st in seen):
             out.append(lid)
     return out
 
