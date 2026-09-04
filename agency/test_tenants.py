@@ -3,8 +3,16 @@
 missing approve credential must refuse rather than fall back."""
 import os
 import sys
+import tempfile
 
 import tenants
+
+# Discovery reads this profile's .env as well as the inherited environment, so
+# clearing MAILHUB_TENANT_* is not enough to reach a known-empty state: on the
+# deployment host the real /opt/data/.env supplies nine live tenants and every
+# "no configuration" assertion below fails against them. An empty HERMES_HOME
+# gives the file half of discovery nothing to find.
+_ISOLATED_HOME = tempfile.mkdtemp(prefix="tenants-test-")
 
 PASSED = 0
 FAILED = 0
@@ -26,6 +34,8 @@ def clear():
     for k in list(os.environ):
         if k.startswith("MAILHUB_TENANT_") or k == "MAILHUB_API_TOKEN":
             del os.environ[k]
+    os.environ["HERMES_HOME"] = _ISOLATED_HOME
+    tenants._FILE_CACHE.update(path=None, mtime=None, values={})
 
 
 def setup(n, approve_for=()):

@@ -73,10 +73,20 @@ def fresh_db():
     con.close()
 
 
+# Same reason as test_tenants: without an empty HERMES_HOME the "only five are
+# forwarded" case below reads the host's real .env and sees all nine, so the
+# very regression this suite exists to catch is invisible. The .env-discovery
+# case later in the file sets its own HERMES_HOME after this and still works.
+_EMPTY_HOME = os.path.join(_TMP, "empty-home")
+os.makedirs(_EMPTY_HOME, exist_ok=True)
+
+
 def set_env(entries=NINE):
     for k in list(os.environ):
         if k.startswith("MAILHUB_TENANT_") or k == "MAILHUB_API_TOKEN":
             del os.environ[k]
+    os.environ["HERMES_HOME"] = _EMPTY_HOME
+    tenants._FILE_CACHE.update(path=None, mtime=None, values={})
     for idx, uid, name in entries:
         os.environ["MAILHUB_TENANT_%d_NAME" % idx] = name
         os.environ["MAILHUB_TENANT_%d_USER_ID" % idx] = str(uid)
