@@ -37,15 +37,27 @@ POLICY_REJECTION = "POLICY_REJECTION"
 RELAY_DENIED = "RELAY_DENIED"
 SPAM_REJECTION = "SPAM_REJECTION"
 AUTHENTICATION_FAILURE = "AUTHENTICATION_FAILURE"
+# OUR provider refusing to transmit OUR message. Nothing has been learned
+# about the recipient at all -- the message never reached their server. On
+# 2026-09-04 twenty-five of these were filed as unknown delivery failures and
+# eleven recipients were marked BOUNCED for it, which records a live mailbox
+# as dead because Google was unhappy with the account writing to it.
+SENDER_POLICY_BLOCK = "SENDER_POLICY_BLOCK"
 UNKNOWN_DELIVERY_FAILURE = "UNKNOWN_DELIVERY_FAILURE"
 NOT_A_BOUNCE = "NOT_A_BOUNCE"
 
 # Which of them justify never writing to that address again. Only these.
 PERMANENT = (HARD_BOUNCE, DOMAIN_FAILURE)
-# Which of them are the receiving side's policy rather than a bad address.
-POLICY = (POLICY_REJECTION, RELAY_DENIED, SPAM_REJECTION, AUTHENTICATION_FAILURE)
+# Which of them are somebody's policy rather than a bad address.
+POLICY = (POLICY_REJECTION, RELAY_DENIED, SPAM_REJECTION,
+          AUTHENTICATION_FAILURE, SENDER_POLICY_BLOCK)
+# The statuses that say something about the RECIPIENT. A sender-side block
+# must never override one of these: if the report names the mailbox as
+# invalid, that is what it is, whoever generated the report.
+RECIPIENT_INVALID = (HARD_BOUNCE, DOMAIN_FAILURE, MAILBOX_FULL)
 
 HUMAN_LABEL = {
+    SENDER_POLICY_BLOCK: "Blocked by our own provider",
     HARD_BOUNCE: "Hard bounce",
     TEMPORARY_FAILURE: "Temporary delivery failure",
     DOMAIN_FAILURE: "Domain does not accept mail",
@@ -145,6 +157,37 @@ PHRASES: List[Tuple[str, str]] = [
     ("greylist", TEMPORARY_FAILURE),
     ("resources temporarily unavailable", TEMPORARY_FAILURE),
 ]
+
+# Google's own wording when it refuses to transmit a message we sent. The
+# support article is specifically the sender-side "blocked messages" page, so
+# its presence is a strong signal on its own; the daemon address alone is not,
+# because the same daemon delivers ordinary recipient bounces.
+_SENDER_BLOCK_PHRASE_RE = re.compile(
+    r"message blocked"
+    r"|your message (?:to [^\s]+ )?has been blocked"
+    r"|\bmessage rejected\b", re.I)
+_SENDER_BLOCK_LINK_RE = re.compile(
+    r"support\.google\.com/mail/(?:answer|\?p=)[^\s]*69585", re.I)
+_GOOGLE_DAEMON_RE = re.compile(
+    r"mailer-daemon@(?:[\w.-]+\.)?(?:googlemail|google)\.com", re.I)
+
+
+def sender_policy_block(from_email: str = "", subject: str = "",
+                        body: str = "") -> bool:
+    """True when OUR provider refused to transmit, rather than the recipient
+    refusing to accept.
+
+    Requires both halves: a report from Google's delivery daemon (or its
+    sender-side blocked-message article) AND its blocking wording. Either
+    alone is not enough -- the same daemon sends ordinary "user unknown"
+    bounces, and "message rejected" appears in recipient-side refusals too.
+    """
+    blob = _text(subject, body)
+    from_google = bool(_GOOGLE_DAEMON_RE.search(from_email or ""))
+    link = bool(_SENDER_BLOCK_LINK_RE.search(blob))
+    phrase = bool(_SENDER_BLOCK_PHRASE_RE.search(blob))
+    return bool(phrase and (from_google or link))
+
 
 _ENHANCED_RE = re.compile(r"\b([45]\.\d{1,3}\.\d{1,3})\b")
 _SMTP_RE = re.compile(r"\b([45]\d{2})[ -]")
@@ -275,7 +318,22 @@ def classify(from_email: str = "", subject: str = "", body: str = "",
     code = enhanced.group(1) if enhanced else (smtp.group(1) if smtp else None)
     out["code"] = code
 
-    # 1. An enhanced status code settles it outright.
+    # 1. Our own provider refusing to transmit. Checked before the phrase
+    # table -- "message rejected" would otherwise fall through to a generic
+    # policy refusal and lose the one fact that matters, which is that the
+    # recipient's server never saw this message and so nothing at all has
+    # been learned about the address. A report that DOES name the mailbox as
+    # invalid still wins: the code is evidence about the recipient, and this
+    # check does not get to overrule it.
+    code_says_recipient = bool(enhanced and enhanced.group(1) in ENHANCED
+                               and ENHANCED[enhanced.group(1)]
+                               in RECIPIENT_INVALID)
+    if not code_says_recipient and sender_policy_block(from_email, subject, body):
+        out.update(status=SENDER_POLICY_BLOCK, confidence=1.0, permanent=False,
+                   needs_human=True, label=HUMAN_LABEL[SENDER_POLICY_BLOCK])
+        return out
+
+    # 2. An enhanced status code settles it outright.
     if enhanced and enhanced.group(1) in ENHANCED:
         status = ENHANCED[enhanced.group(1)]
         # 5.7.1 is the one code that is genuinely two different things: a
@@ -290,7 +348,7 @@ def classify(from_email: str = "", subject: str = "", body: str = "",
         out["needs_human"] = status in POLICY
         return out
 
-    # 2. Otherwise a phrase, corroborated by the SMTP class where there is one.
+    # 3. Otherwise a phrase, corroborated by the SMTP class where there is one.
     for phrase, status in PHRASES:
         if phrase in low:
             temporary_class = bool(smtp and smtp.group(1).startswith("4"))
@@ -306,7 +364,7 @@ def classify(from_email: str = "", subject: str = "", body: str = "",
             out["needs_human"] = (status in POLICY) or out["confidence"] < 0.8
             return out
 
-    # 3. It is a bounce, but nothing in it says why.
+    # 4. It is a bounce, but nothing in it says why.
     if smtp and smtp.group(1).startswith("4"):
         out.update(status=TEMPORARY_FAILURE, confidence=0.7,
                    label=HUMAN_LABEL[TEMPORARY_FAILURE])
@@ -351,6 +409,10 @@ ACTIONS = {
                      "Escalate if more than one domain is refusing"],
     AUTHENTICATION_FAILURE: ["Do not suppress the recipient",
                              "Check SPF, DKIM and DMARC for the sending domain"],
+    SENDER_POLICY_BLOCK: ["Do NOT suppress the recipient: they never saw it",
+                          "Pause the sending mailbox and check its reputation",
+                          "Hold the follow-up rather than cancelling it",
+                          "Retry from a healthy sender once the block clears"],
     UNKNOWN_DELIVERY_FAILURE: ["Read the diagnostic text and decide",
                                "Do not suppress until the reason is known"],
 }

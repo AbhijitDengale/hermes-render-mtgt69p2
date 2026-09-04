@@ -367,6 +367,16 @@ def queue_and_send(con, lead) -> Optional[str]:
     # recomputed. MailHub matches an approval on (owner_user_id, content_hash),
     # so queueing through any other tenant presents an approval that does not
     # exist there and the message would be refused.
+    # A paused mailbox keeps everything it owns and simply does not transmit
+    # while it is standing down. Re-routing to a healthy sender instead would
+    # move the conversation to an address the recipient has never heard from,
+    # and the approval MailHub holds is filed under the original owner anyway.
+    stood_down = tenants.is_paused(con, draft["tenant_user_id"])
+    if stood_down:
+        return ("READY_TO_SEND: holding, sender %s paused until %s (%s)"
+                % (draft["tenant_user_id"], stood_down.get("paused_until"),
+                   (stood_down.get("paused_reason") or "")[:60]))
+
     route = tenants.for_message(draft["tenant_user_id"], lead["id"], con)
     if route["status"] != "persisted":
         detail = {

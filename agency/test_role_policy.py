@@ -39,13 +39,31 @@ def check(name, cond, detail=""):
 
 
 def clean(email="info@company.com", **kw):
-    """The evidence a clean role address actually carries in production:
-    deliverable, an MX host, one flag, score 55."""
+    """A role address that is clean on every axis INCLUDING the mailbox.
+
+    Mailbox evidence is part of "clean" as of 2026-09-04. Before that, this
+    fixture stopped at the domain -- deliverable, an MX host -- and the policy
+    released addresses on that basis; 291 such sends produced 24 failures
+    against 0 for named addresses. A domain answering says nothing about
+    whether `info@` exists behind it, so the fixture now carries the answer
+    to the question that actually matters. `domain_only()` keeps the old
+    shape for the tests that assert it is no longer enough.
+    """
     rec = {"status": "risky", "decision": "hold", "deliverable": True,
            "score": 55, "reason": "role_account", "flags": ["role_account"],
            "did_you_mean": None, "mx_host": "mx.company.com",
-           "verified_email": email, "attempts": 1}
+           "verified_email": email, "attempts": 1,
+           "verification_level": "mailbox", "mailbox_status": "valid"}
     rec.update(kw)
+    return rec
+
+
+def domain_only(email="info@company.com", **kw):
+    """What every record written before 2026-09-04 carries: the domain was
+    checked and the mailbox was not."""
+    rec = clean(email, **kw)
+    rec.pop("verification_level", None)
+    rec.pop("mailbox_status", None)
     return rec
 
 
@@ -189,9 +207,13 @@ def main() -> int:
 
     print("\n--- 10. The worker writes the promotion through correctly ---")
     lead = {"id": "L1", "email": "info@company.com", "raw_data": {}}
+    # Mailbox-confirmed, because domain-level evidence no longer releases a
+    # role address -- see 10b. A verifier result without these two fields is
+    # the pre-2026-09-04 shape and is held instead.
     result = {"email": "info@company.com", "status": "risky", "score": 55,
               "reason": "role_account", "flags": ["role_account"],
               "deliverable": True, "mx_host": "mx.company.com",
+              "verification_level": "mailbox", "mailbox_status": "valid",
               "did_you_mean": None, "cached": False, "took_ms": 5, "error": None}
     out = VW.apply_result(lead, result)
     check("an approved role account is written as valid and eligible",
@@ -219,6 +241,34 @@ def main() -> int:
     check("an excluded role account is rejected",
           out["fields"]["email_verification_status"] == "invalid"
           and out["decision"] == "reject" and out["fields"]["status"] == "rejected")
+
+    print(chr(10) + "--- 10b. Domain-level evidence is no longer enough ---")
+    v = RAP.evaluate("info@company.com", domain_only())
+    check("a role address checked only at the domain is held",
+          v["status"] == "risky" and v["reason"] == RAP.REASON_NO_MAILBOX_PROOF
+          and not v["eligible"], "%s / %s" % (v["status"], v["reason"]))
+    check("  and it says why, so the hold can be lifted deliberately",
+          any("mailbox" in b for b in v["blockers"]), str(v["blockers"]))
+    v = RAP.evaluate("info@company.com", clean())
+    check("a mailbox-confirmed role address may become valid",
+          v["status"] == "valid" and v["eligible"], v["status"])
+    v = RAP.evaluate("info@company.com", clean(mailbox_status="catch_all"))
+    check("a catch-all domain stays risky: acceptance proves nothing",
+          v["status"] == "risky" and v["reason"] == RAP.REASON_CATCH_ALL,
+          "%s / %s" % (v["status"], v["reason"]))
+    v = RAP.evaluate("info@company.com", clean(mailbox_status="invalid"))
+    check("a mailbox proven absent is rejected outright",
+          v["status"] == "invalid" and not v["eligible"], v["status"])
+    v = RAP.evaluate("info@company.com", clean(mailbox_status="unknown"))
+    check("an inconclusive mailbox check holds rather than releases",
+          v["status"] == "risky" and not v["eligible"], v["status"])
+    v = RAP.evaluate("info@gmail.com", clean("info@gmail.com"))
+    check("  a free provider is still refused even when mailbox-confirmed",
+          v["status"] == "risky" and v["reason"] == RAP.REASON_FREE, v["reason"])
+    v = RAP.evaluate("nadim@company.com", clean("nadim@company.com"))
+    check("a named address is untouched by any of this",
+          v["status"] is None and v["tier"] == RAP.NOT_ROLE,
+          "policy has nothing to say about non-role addresses")
 
     print("\n--- 11. Nothing unrelated moved ---")
     check("the admission map is unchanged",

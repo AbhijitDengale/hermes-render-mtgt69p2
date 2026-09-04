@@ -217,7 +217,45 @@ def eligible(con: sqlite3.Connection, state: str,
         " WHERE l.state=? "
         "   AND (l.locked_until IS NULL OR l.locked_until < datetime('now')) "
         "   AND COALESCE(c.status, 'active') = 'active' "
+        # A hold stops a lead being worked without moving it. Withdrawing a
+        # batch by changing state would rewrite where each lead had actually
+        # got to and could not be undone; clearing this column can.
+        "   AND l.hold_reason IS NULL "
         " ORDER BY l.updated_at ASC LIMIT ?", (state, limit)).fetchall()
+
+
+def hold(con: sqlite3.Connection, lead_id: str, reason: str) -> bool:
+    """Make a lead ineligible for work without moving it. Reversible."""
+    cur = con.execute(
+        "UPDATE leads SET hold_reason=?, held_at=datetime('now'),"
+        "       updated_at=datetime('now')"
+        " WHERE id=? AND hold_reason IS NULL", (reason, lead_id))
+    return cur.rowcount > 0
+
+
+def release_hold(con: sqlite3.Connection, lead_id: str,
+                 reason: Optional[str] = None) -> bool:
+    """Let a held lead be worked again. `reason` restricts it to one batch."""
+    sql = ("UPDATE leads SET hold_reason=NULL, held_at=NULL,"
+           "       updated_at=datetime('now') WHERE id=? AND hold_reason IS NOT NULL")
+    args: List[Any] = [lead_id]
+    if reason:
+        sql += " AND hold_reason=?"
+        args.append(reason)
+    return con.execute(sql, args).rowcount > 0
+
+
+def held(con: sqlite3.Connection, reason: Optional[str] = None) -> Dict[str, int]:
+    """How many leads are held, by reason and state, for reporting."""
+    sql = ("SELECT hold_reason, state, COUNT(*) n FROM leads"
+           " WHERE hold_reason IS NOT NULL")
+    args: List[Any] = []
+    if reason:
+        sql += " AND hold_reason=?"
+        args.append(reason)
+    sql += " GROUP BY hold_reason, state"
+    return {"%s/%s" % (r["hold_reason"], r["state"]): r["n"]
+            for r in con.execute(sql, args)}
 
 
 def counts(con: sqlite3.Connection) -> Dict[str, int]:

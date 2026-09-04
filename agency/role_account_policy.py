@@ -32,7 +32,35 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-POLICY_VERSION = "role-account-2026-09-03"
+POLICY_VERSION = "role-account-2026-09-04-mailbox-gated"
+
+# How far the verifier actually looked.
+#
+# The first version of this policy accepted domain-level evidence -- syntax,
+# MX, and a "deliverable" domain -- as enough to release a guessed `info@`.
+# Of 291 role addresses sent on that basis, 24 failed: twelve came back
+# `550 5.4.1 Recipient address rejected`, and the reputation damage from those
+# had Google blocking the rest. Over the same period 93 named addresses
+# bounced none. A domain answering on port 25 says nothing about whether
+# `info@` exists behind it, and for a guessed local part that is the only
+# question worth asking.
+LEVEL_DOMAIN = "domain"
+LEVEL_MAILBOX = "mailbox"
+
+# What a mailbox-level check found.
+MAILBOX_VALID = "valid"
+MAILBOX_INVALID = "invalid"
+MAILBOX_CATCH_ALL = "catch_all"
+MAILBOX_UNKNOWN = "unknown"
+
+# Only this releases a role address. catch_all is explicitly NOT enough: a
+# catch-all domain accepts every local part at RCPT time and discards or
+# bounces later, so it produces exactly the false confidence that caused this.
+MAILBOX_RELEASES = (MAILBOX_VALID,)
+
+REASON_NO_MAILBOX_PROOF = "role_account_domain_only"
+REASON_MAILBOX_INVALID = "role_account_mailbox_invalid"
+REASON_CATCH_ALL = "role_account_catch_all"
 
 # Published, front-of-house mailboxes. Mail sent here is expected.
 APPROVED = frozenset((
@@ -134,6 +162,23 @@ def is_free_provider(email: str) -> bool:
     return split(email)[1] in FREE_PROVIDERS
 
 
+def mailbox_evidence(record: Dict[str, Any]) -> Tuple[str, str]:
+    """(verification_level, mailbox_status) as the verifier reported them.
+
+    Absent fields mean the verifier only looked at the domain, which is what
+    every record written before 2026-09-04 did. Treating a missing field as
+    mailbox-confirmed would re-release the whole set this policy just held.
+    """
+    level = str(record.get("verification_level") or LEVEL_DOMAIN).strip().lower()
+    status = str(record.get("mailbox_status") or "").strip().lower()
+    if level != LEVEL_MAILBOX:
+        return LEVEL_DOMAIN, ""
+    if status not in (MAILBOX_VALID, MAILBOX_INVALID, MAILBOX_CATCH_ALL,
+                      MAILBOX_UNKNOWN):
+        return LEVEL_MAILBOX, MAILBOX_UNKNOWN
+    return LEVEL_MAILBOX, status
+
+
 def technical_checks(record: Dict[str, Any], email: str) -> Dict[str, bool]:
     """Everything that must be true before policy is even consulted.
 
@@ -205,6 +250,33 @@ def evaluate(email: str, record: Optional[Dict[str, Any]] = None,
         out.update(status="risky", reason=REASON_RESTRICTED, eligible=False)
         return out
 
+    # An approved role word, clean on every other axis -- and still not enough.
+    # The address is a guess until something has actually asked the receiving
+    # server about this local part.
+    level, mailbox = mailbox_evidence(record)
+    out["verification_level"] = level
+    out["mailbox_status"] = mailbox
+    if level != LEVEL_MAILBOX:
+        out.update(status="risky", reason=REASON_NO_MAILBOX_PROOF,
+                   eligible=False)
+        out["blockers"].append("domain-level verification only; the mailbox "
+                               "itself was never checked")
+        return out
+    if mailbox == MAILBOX_INVALID:
+        out.update(status="invalid", reason=REASON_MAILBOX_INVALID,
+                   eligible=False)
+        out["blockers"].append("mailbox does not exist")
+        return out
+    if mailbox == MAILBOX_CATCH_ALL:
+        out.update(status="risky", reason=REASON_CATCH_ALL, eligible=False)
+        out["blockers"].append("catch-all domain: acceptance proves nothing")
+        return out
+    if mailbox not in MAILBOX_RELEASES:
+        out.update(status="risky", reason=REASON_NO_MAILBOX_PROOF,
+                   eligible=False)
+        out["blockers"].append("mailbox check inconclusive")
+        return out
+
     out.update(status="valid", reason=REASON_ALLOWED, eligible=True)
     return out
 
@@ -246,10 +318,11 @@ def audit_entry(previous: Dict[str, Any], verdict: Dict[str, Any],
 def categorise(email: str, record: Dict[str, Any], **history) -> str:
     """A|B|C|D for reporting, before anything is written.
 
-        A  approved B2B role only          -> may become valid
-        B  role + free provider            -> stays risky
-        C  restricted or excluded role     -> stays risky / rejected
-        D  carries some other risk flag    -> stays risky, out of scope
+        A  approved role, mailbox-confirmed -> may become valid
+        B  role + free provider             -> stays risky
+        C  restricted or excluded role      -> stays risky / rejected
+        D  anything else, including an approved role with only domain-level
+           evidence                         -> stays risky
     """
     if not sole_reason_is_role(record):
         return "D"

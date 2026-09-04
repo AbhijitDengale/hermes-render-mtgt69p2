@@ -315,6 +315,14 @@ def verification_record(result: Dict[str, Any], attempts: int,
         "flags": result.get("flags") or [],
         "did_you_mean": result.get("did_you_mean"),
         "mx_host": result.get("mx_host"),
+        # How far the check actually looked, and what it found at the mailbox.
+        # A verifier that only resolves MX reports the domain level, and the
+        # role-account policy refuses to release a guessed local part on that
+        # alone -- an answering domain says nothing about whether `info@`
+        # exists behind it. Absent means domain-level, which is what every
+        # record written before 2026-09-04 is.
+        "verification_level": result.get("verification_level") or "domain",
+        "mailbox_status": result.get("mailbox_status"),
         "cached": result.get("cached"),
         "took_ms": result.get("took_ms"),
         "error": scrub(result.get("error") or "") or None,

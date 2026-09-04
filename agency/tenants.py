@@ -173,6 +173,37 @@ def health_rows(con: sqlite3.Connection) -> Dict[str, Dict[str, Any]]:
     return {r["tenant_name"]: dict(r) for r in rows}
 
 
+def paused(con: Optional[sqlite3.Connection] = None) -> Dict[int, Dict[str, Any]]:
+    """Mailboxes standing down, by user id, with the reason and until when.
+
+    A pause is deliberately not a credential change. Revoking OAuth or
+    clearing an alias to stop a mailbox sending would take a working account
+    apart to answer a temporary reputation problem, and putting it back is not
+    the same account to Google. This is a row in our own table that expires.
+    """
+    if con is None:
+        return {}
+    out: Dict[int, Dict[str, Any]] = {}
+    try:
+        rows = con.execute(
+            "SELECT user_id, paused_until, paused_reason, paused_at"
+            "  FROM tenant_health"
+            " WHERE paused_until IS NOT NULL"
+            "   AND paused_until > datetime('now')").fetchall()
+    except sqlite3.Error:
+        return out                       # migration not applied yet
+    for r in rows:
+        out[r["user_id"]] = dict(r)
+    return out
+
+
+def is_paused(con: Optional[sqlite3.Connection], user_id: Any) -> Optional[Dict[str, Any]]:
+    try:
+        return paused(con).get(int(user_id))
+    except (TypeError, ValueError):
+        return None
+
+
 def ready(con: Optional[sqlite3.Connection] = None,
           pool: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
     """Tenants that are complete enough to be given a new lead.
@@ -181,15 +212,22 @@ def ready(con: Optional[sqlite3.Connection] = None,
     any one credential would strand leads -- unapprovable, unqueueable, or with
     replies nobody reads -- so it is left out of routing rather than allowed to
     half-work.
+
+    A paused mailbox is excluded here too, so no NEW lead is allocated to it.
+    What it already owns stays its own: pausing is about protecting an account
+    whose reputation is in trouble, not about moving its conversations
+    somewhere else.
     """
     pool = load() if pool is None else pool
     if con is None:
         return pool
     health = health_rows(con)
+    off = paused(con)
     out = []
     for t in pool:
         h = health.get(t["name"])
-        if h and all(h.get(c) for c in READY_COLUMNS):
+        if h and all(h.get(c) for c in READY_COLUMNS) \
+                and t.get("user_id") not in off:
             out.append(t)
     return out
 
