@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import sqlite3
 import json
 import os
 import subprocess
@@ -97,18 +98,31 @@ def gen(lead) -> int:
         return 1
 
 
-def dispatch(lead_id: str, profile: str, title: str, body: str,
-             stage_key: str, generation: int = 1) -> Dict[str, Any]:
-    """Create the task, or return the existing one.
+# A task in one of these has stopped for good. Kanban still resolves the
+# idempotency key to it, so re-issuing that key returns the finished task and
+# creates nothing.
+TERMINAL_TASK_STATUSES = frozenset(("done", "archived", "cancelled",
+                                    "completed"))
 
-    The idempotency key is (lead, lifecycle generation, stage). Within one
-    lifecycle a tick that runs twice — or a restart mid-stage — collapses onto
-    the same task, which is the protection worth keeping. Across lifecycles it
-    does not: a lead that was deleted and re-ingested used to match the
-    COMPLETED task from its previous life, so Kanban handed that task back,
-    no worker was spawned, and the lead sat in RESEARCHING forever.
-    """
-    key = "agency:%s:gen:%d:%s" % (lead_id, generation, stage_key)
+# How many times one stage may be re-offered after a dead-end finish. Bounded,
+# so a stage that genuinely cannot succeed stops instead of minting a task
+# every two minutes for ever; whatever is left shows up in board_health().
+MAX_TASK_RESCUES = int(os.getenv("AGENCY_MAX_TASK_RESCUES", "3"))
+
+# How long a lead may sit in RESEARCHING before its task is checked for having
+# died quietly. Comfortably longer than a NOVA run, which takes seconds.
+RESEARCH_STALE_MINUTES = int(os.getenv("AGENCY_RESEARCH_STALE_MIN", "20"))
+
+NOVA_BRIEF = ("You are NOVA. Research this business using the research tool, "
+              "then call save_research with your findings. Every observation "
+              "must carry a source_url and a quoted evidence string. If you "
+              "cannot fetch anything, report research_status 'failed' — never "
+              "write findings you did not fetch this session.")
+
+
+def _create_task(key: str, profile: str, title: str,
+                 body: str) -> Dict[str, Any]:
+    """Create the task for this key, or return whatever already holds it."""
     cmd = [HERMES, "kanban", "create", title, "--assignee", profile,
            "--body", body, "--idempotency-key", key, "--json"]
     env = {**os.environ, "HOME": os.getenv("HERMES_HOME", "/opt/data"),
@@ -123,6 +137,44 @@ def dispatch(lead_id: str, profile: str, title: str, body: str,
             return {"raw": text[:300], "ok": out.returncode == 0}
     except Exception as exc:
         return {"error": "%s: %s" % (type(exc).__name__, exc)}
+
+
+def dispatch(lead_id: str, profile: str, title: str, body: str,
+             stage_key: str, generation: int = 1) -> Dict[str, Any]:
+    """Create the task, or return the existing one.
+
+    The idempotency key is (lead, lifecycle generation, stage). Within one
+    lifecycle a tick that runs twice — or a restart mid-stage — collapses onto
+    the same task, which is the protection worth keeping. Across lifecycles it
+    does not: a lead that was deleted and re-ingested used to match the
+    COMPLETED task from its previous life, so Kanban handed that task back,
+    no worker was spawned, and the lead sat in RESEARCHING forever.
+
+    The same collapse happens WITHIN a lifecycle when a task finishes without
+    doing its work — an agent that answered conversationally and never called
+    save_draft, or that was reclaimed and completed having written nothing.
+    The key still resolves to that finished task, so every later tick received
+    it, created nothing, and the lead waited for a worker that would never be
+    spawned again. It cost 108 leads eleven hours on 2026-09-04, and unlike a
+    blocked task it left nothing on the board to show for it.
+
+    Callers must have established that the stage's OUTPUT is missing before
+    calling — dispatch_copy loads the draft first, dispatch_qa the verdict —
+    because a finished task is only a dead end when the work is genuinely
+    absent. Given that, re-offering under a fresh key is safe: every write
+    these agents make is keyed on (lead, stage), so a second run replaces
+    rather than duplicates, and pipeline.save_draft refuses outright to
+    overwrite anything already queued or sent.
+    """
+    base = "agency:%s:gen:%d:%s" % (lead_id, generation, stage_key)
+    res = _create_task(base, profile, title, body)
+    for attempt in range(1, MAX_TASK_RESCUES + 1):
+        status = str((res or {}).get("status") or "").strip().lower()
+        if status not in TERMINAL_TASK_STATUSES:
+            return res                   # live, queued, or unreadable
+        res = _create_task("%s:rescue:%d" % (base, attempt), profile, title,
+                           body)
+    return res
 
 
 def brief(assignment: Dict[str, Any], instruction: str) -> str:
@@ -144,12 +196,7 @@ def admit(con, lead) -> str:
 def dispatch_research(con, lead) -> str:
     res = dispatch(
         lead["id"], "nova", "Research lead %s" % lead["id"],
-        brief({"lead_id": lead["id"]},
-              "You are NOVA. Research this business using the research tool, "
-              "then call save_research with your findings. Every observation "
-              "must carry a source_url and a quoted evidence string. If you "
-              "cannot fetch anything, report research_status 'failed' — never "
-              "write findings you did not fetch this session."),
+        brief({"lead_id": lead["id"]}, NOVA_BRIEF),
         "research", gen(lead))
     with P.writing(con):
         P.transition(con, lead["id"], "RESEARCHING", AGENT,
@@ -158,9 +205,30 @@ def dispatch_research(con, lead) -> str:
     return "RESEARCH_PENDING -> RESEARCHING (task %s)" % res.get("id", "?")
 
 
+def _stale_since(con, lead_id: str, minutes: int) -> bool:
+    """Has this lead sat in its current state longer than `minutes`?"""
+    row = con.execute(
+        "SELECT state_changed_at < datetime('now', ?) FROM leads WHERE id=?",
+        ("-%d minutes" % minutes, lead_id)).fetchone()
+    return bool(row and row[0])
+
+
 def collect_research(con, lead) -> Optional[str]:
     research = P.load_research(con, lead["id"])
     if not research:
+        # Every other stage re-offers its work each tick, so a dead-end task is
+        # noticed there. RESEARCHING only waits, which means a NOVA task that
+        # finished without calling save_research strands the lead in silence.
+        # Re-offering the same key costs nothing while the task is alive and
+        # rescues it once it is not -- but only after long enough that a
+        # working NOVA is never interrupted.
+        if _stale_since(con, lead["id"], RESEARCH_STALE_MINUTES):
+            res = dispatch(lead["id"], "nova", "Research lead %s" % lead["id"],
+                           brief({"lead_id": lead["id"]}, NOVA_BRIEF),
+                           "research", gen(lead))
+            if str((res or {}).get("status") or "").lower() \
+                    not in TERMINAL_TASK_STATUSES:
+                return "RESEARCHING: NOVA task re-offered (%s)" % res.get("id", "?")
         return None                      # NOVA still working
     status = (research.get("research_status") or "").lower()
     obs = research.get("verified_observations") or []
@@ -625,6 +693,111 @@ def _epoch(value: Any) -> Optional[float]:
         return None
 
 
+# A running task older than this is worth mentioning. It is not a fault by
+# itself -- during the 2026-09-04 provider outage eight ARIA workers ran for
+# ten hours, alive and heartbeating the whole time, and reclaiming them would
+# have thrown away work that later completed -- but it is the first thing to
+# look at when the pipeline is quiet.
+RUNNING_WARN_MINUTES = int(os.getenv("AGENCY_RUNNING_WARN_MIN", "45"))
+
+
+def _kanban_db_path() -> str:
+    return os.path.join(os.getenv("HERMES_HOME", "/opt/data"), "kanban.db")
+
+
+def _pid_alive(pid) -> Optional[bool]:
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True                      # exists, owned by someone else
+    except (TypeError, ValueError):
+        return None                      # no pid recorded
+
+
+def board_health() -> Dict[str, Any]:
+    """Counts worth alerting on, read straight from Kanban's own store.
+
+    `kanban list --json` does not expose worker_pid or last_heartbeat_at, and
+    those two are the only real evidence of whether a running task is alive.
+    Reading the database read-only gets them without asking Kanban to reason
+    about staleness on our behalf -- deciding that is Kanban's job, and it
+    already does it well. This only reports.
+    """
+    out: Dict[str, Any] = {"running": 0, "blocked": 0, "ready": 0,
+                           "running_over_warn": 0, "zombie_suspects": 0,
+                           "oldest_running_min": 0, "oldest_blocked_min": 0}
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % _kanban_db_path(), uri=True)
+        con.row_factory = sqlite3.Row
+    except sqlite3.Error:
+        return out
+    now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+    try:
+        rows = con.execute(
+            "SELECT id, status, assignee, started_at, worker_pid,"
+            "       last_heartbeat_at FROM tasks"
+            " WHERE status IN ('running','blocked','ready')").fetchall()
+    except sqlite3.Error:
+        con.close()
+        return out
+    suspects = []
+    for r in rows:
+        st = r["status"]
+        out[st] = out.get(st, 0) + 1
+        started = r["started_at"] or 0
+        age = (now - int(started)) // 60 if started else 0
+        if st == "running":
+            out["oldest_running_min"] = max(out["oldest_running_min"], age)
+            if age >= RUNNING_WARN_MINUTES:
+                out["running_over_warn"] += 1
+            # A suspect is a running task with no live worker AND no recent
+            # heartbeat. Kanban reclaims these itself; if one persists across
+            # ticks, that is the thing to escalate.
+            hb = r["last_heartbeat_at"]
+            hb_age = (now - int(hb)) if hb else None
+            if _pid_alive(r["worker_pid"]) is False and (
+                    hb_age is None or hb_age > 60 * 60):
+                suspects.append(r["id"])
+        elif st == "blocked":
+            out["oldest_blocked_min"] = max(out["oldest_blocked_min"], age)
+    con.close()
+    out["zombie_suspects"] = len(suspects)
+    out["zombie_suspect_ids"] = suspects[:10]
+    return out
+
+
+def stranded_leads(con, limit: int = 200) -> List[str]:
+    """Leads waiting on a stage whose output never arrived.
+
+    Reported, not repaired: dispatch() re-offers these on the ordinary tick.
+    A count that does not fall over successive ticks means the rescue budget
+    is spent and a person should look.
+    """
+    out = []
+    try:
+        rows = con.execute(
+            "SELECT id, state, followup_stage FROM leads"
+            " WHERE state IN ('COPY_PENDING','QA_PENDING','RESEARCHING')"
+            " LIMIT ?", (limit,)).fetchall()
+    except sqlite3.Error:
+        return out
+    for r in rows:
+        lid, state = r["id"], r["state"]
+        if state == "RESEARCHING":
+            if not P.load_research(con, lid):
+                out.append(lid)
+            continue
+        draft = P.load_draft(con, lid, r["followup_stage"] or 0)
+        if state == "COPY_PENDING" and not draft:
+            out.append(lid)
+        elif state == "QA_PENDING" and (not draft or not draft["qa_status"]):
+            out.append(lid)
+    return out
+
+
 def reap_blocked(limit: int = BLOCKED_PER_TICK) -> List[str]:
     """Offer blocked agent tasks back to the board.
 
@@ -697,6 +870,20 @@ def tick(limit: int = 5, only: Optional[str] = None) -> List[str]:
             log.extend(reap_blocked())
         except Exception as exc:
             log.append("reap: %s: %s" % (type(exc).__name__, exc))
+        # Say what the board looks like every tick. A stall used to be visible
+        # only by noticing that nothing had happened for hours.
+        try:
+            h = board_health()
+            if h["running_over_warn"] or h["blocked"] or h["zombie_suspects"]:
+                log.append(
+                    "board: running=%d (>%dm: %d) blocked=%d ready=%d "
+                    "oldest_running=%dm oldest_blocked=%dm zombie_suspects=%d"
+                    % (h["running"], RUNNING_WARN_MINUTES,
+                       h["running_over_warn"], h["blocked"], h["ready"],
+                       h["oldest_running_min"], h["oldest_blocked_min"],
+                       h["zombie_suspects"]))
+        except Exception as exc:
+            log.append("board_health: %s: %s" % (type(exc).__name__, exc))
         for state, handler in HANDLERS:
             if only and state != only:
                 continue
