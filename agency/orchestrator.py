@@ -20,6 +20,7 @@ the approved content hash, so a retried send returns the original message.
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import os
 import subprocess
@@ -580,6 +581,103 @@ def reconcile_queued(con, limit: int = 50) -> List[str]:
     return log
 
 
+AGENT_PROFILES = ("nova", "aria", "sentinel", "echo", "leo")
+
+# How long a task is left alone after it last stopped, before it is offered
+# again. Long enough that a provider having a bad minute is not hammered,
+# short enough that a recovered one is picked up while the day is still young.
+BLOCKED_COOLDOWN_MINUTES = int(os.getenv("AGENCY_BLOCKED_COOLDOWN_MIN", "15"))
+BLOCKED_PER_TICK = int(os.getenv("AGENCY_BLOCKED_PER_TICK", "20"))
+
+
+def _kanban_json(*args: str) -> Any:
+    env = {**os.environ, "HOME": os.getenv("HERMES_HOME", "/opt/data"),
+           "HERMES_HOME": os.getenv("HERMES_HOME", "/opt/data")}
+    try:
+        out = subprocess.run([HERMES, "kanban", *args], capture_output=True,
+                             text=True, timeout=120, env=env)
+        return json.loads((out.stdout or "").strip() or "null")
+    except Exception:
+        return None
+
+
+def _epoch(value: Any) -> Optional[float]:
+    """Seconds since the epoch, from whichever shape the board reports.
+
+    Kanban returns these as integers, not ISO strings. Comparing them as text
+    against a formatted timestamp is not a comparison at all -- "1788466776"
+    sorts before "2026-.." on its first character -- so every task looked
+    equally stale and the cooldown did nothing.
+    """
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        pass
+    try:
+        text = str(value).replace("Z", "+00:00")
+        when = datetime.datetime.fromisoformat(text)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=datetime.timezone.utc)
+        return when.timestamp()
+    except Exception:
+        return None
+
+
+def reap_blocked(limit: int = BLOCKED_PER_TICK) -> List[str]:
+    """Offer blocked agent tasks back to the board.
+
+    Kanban blocks a task once its retries are spent. That is right for a task
+    that cannot succeed, and wrong for one that failed because the model
+    endpoint was refusing requests: the work is fine and the world has moved
+    on. Nothing retried those, and because dispatch is idempotent the
+    orchestrator kept receiving the same blocked task and creating no new
+    work, so the pipeline stayed frozen after the provider recovered. One
+    provider outage of ninety minutes cost six hours of stillness and 251
+    stranded tasks.
+
+    A task is left alone for a cooldown after it last stopped, so a provider
+    having a bad minute is retried patiently rather than hammered, and only a
+    bounded number are offered per tick. If the endpoint is still refusing,
+    they simply block again and are tried once more later; when it recovers,
+    the queue drains on its own.
+    """
+    tasks = _kanban_json("list", "--json")
+    if not tasks:
+        return []
+    rows = tasks.get("tasks", tasks) if isinstance(tasks, dict) else tasks
+    cutoff = (datetime.datetime.now(datetime.timezone.utc).timestamp()
+              - BLOCKED_COOLDOWN_MINUTES * 60)
+    stale = []
+    for t in rows:
+        if not isinstance(t, dict) or t.get("status") != "blocked":
+            continue
+        if t.get("assignee") not in AGENT_PROFILES:
+            continue
+        when = _epoch(t.get("completed_at") or t.get("started_at")
+                      or t.get("created_at"))
+        if when is not None and when > cutoff:
+            continue                    # still cooling down
+        stale.append((when if when is not None else 0.0, t))
+    if not stale:
+        return []
+    stale.sort(key=lambda pair: pair[0])
+    stale = [t for _, t in stale]
+    log = []
+    for t in stale[:limit]:
+        _kanban_json("unblock", t["id"], "--reason",
+                     "retried by the orchestrator: blocked after its retries "
+                     "were spent, which is usually the model endpoint refusing "
+                     "requests rather than anything wrong with the task")
+        log.append("unblocked %s (%s) %s" % (t["id"], t.get("assignee"),
+                                             (t.get("title") or "")[:48]))
+    if len(stale) > limit:
+        log.append("%d more blocked task(s) left for the next tick"
+                   % (len(stale) - limit))
+    return log
+
+
 def tick(limit: int = 5, only: Optional[str] = None) -> List[str]:
     """One orchestration pass. Safe to run repeatedly and concurrently."""
     log: List[str] = []
@@ -592,6 +690,13 @@ def tick(limit: int = 5, only: Optional[str] = None) -> List[str]:
             log.extend(reconcile_queued(con))
         except Exception as exc:
             log.append("reconcile: %s: %s" % (type(exc).__name__, exc))
+        # A stage only moves when its agent task runs. One blocked task is one
+        # lead that will never advance on its own, however healthy everything
+        # else looks, so they are offered back before any state is examined.
+        try:
+            log.extend(reap_blocked())
+        except Exception as exc:
+            log.append("reap: %s: %s" % (type(exc).__name__, exc))
         for state, handler in HANDLERS:
             if only and state != only:
                 continue
