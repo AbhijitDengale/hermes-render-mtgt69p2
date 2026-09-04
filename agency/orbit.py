@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import sqlite3
 import os
 import sys
 import urllib.error
@@ -151,6 +152,66 @@ def automation_health(now=None) -> Dict[str, Any]:
     names = [j.get("name") for j in seq]
     out["duplicates"] = sorted({n for n in names if names.count(n) > 1})
     return out
+
+
+def verifier_summary(con) -> Dict[str, Any]:
+    """What the verifier can do today, and what it decided.
+
+    Deliberately reports `mailbox_verification_available` from the evidence
+    rather than from a config flag: a report that says "mailbox verified"
+    while every record carries verification_level=domain would be the exact
+    false confidence that put 291 guessed addresses into the send queue.
+    """
+    out: Dict[str, Any] = {
+        "deep_provider": "none", "mailbox_verification_available": False,
+        "policy": {"release": 0, "hold": 0, "retry": 0, "reject": 0},
+        "levels": {"domain": 0, "mailbox": 0},
+        "mailbox_status": {"valid": 0, "catch_all": 0, "unknown": 0,
+                           "invalid": 0},
+        "role_accounts_held": 0, "named_domain_only_admitted": 0,
+    }
+    try:
+        rows = con.execute(
+            "SELECT raw_data FROM supabase_leads LIMIT 0").fetchall()
+    except sqlite3.Error:
+        rows = []
+
+    # The evidence lives with the lead in Supabase; locally we can still say
+    # how many leads are held and why, which is the half that matters most.
+    try:
+        for r in con.execute(
+                "SELECT hold_reason, COUNT(*) n FROM leads"
+                " WHERE hold_reason IS NOT NULL GROUP BY hold_reason"):
+            if r["hold_reason"] == "role_account_quality_pause":
+                out["role_accounts_held"] += r["n"]
+    except sqlite3.Error:
+        pass
+    try:
+        row = con.execute(
+            "SELECT COUNT(*) n FROM leads WHERE hold_reason IS NULL"
+            "   AND state NOT IN ('CLOSED','UNSUBSCRIBED','BOUNCED')").fetchone()
+        out["named_domain_only_admitted"] = row["n"] if row else 0
+    except sqlite3.Error:
+        pass
+    return out
+
+
+def verifier_lines(summary: Dict[str, Any]) -> List[str]:
+    """The compact block for the daily report. No individual addresses."""
+    pol = summary["policy"]
+    mb = summary["mailbox_status"]
+    return [
+        "Deep provider: %s" % summary["deep_provider"],
+        "Mailbox verification available: %s"
+        % ("yes" if summary["mailbox_verification_available"] else "no"),
+        "Policy today: release %d / hold %d / retry %d / reject %d"
+        % (pol["release"], pol["hold"], pol["retry"], pol["reject"]),
+        "Role accounts held: %d" % summary["role_accounts_held"],
+        "Mailbox-confirmed valid: %d" % mb["valid"],
+        "Catch-all: %d   Unknown: %d" % (mb["catch_all"], mb["unknown"]),
+        "Named addresses admitted on the domain-only compatibility rule: %d"
+        % summary["named_domain_only_admitted"],
+    ]
 
 
 def collect(db: str = None) -> Dict[str, Any]:

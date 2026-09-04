@@ -323,6 +323,15 @@ def verification_record(result: Dict[str, Any], attempts: int,
         # record written before 2026-09-04 is.
         "verification_level": result.get("verification_level") or "domain",
         "mailbox_status": result.get("mailbox_status"),
+        # The worker's own admission verdict and why. Stored under
+        # `verification_policy` rather than `policy` on purpose: `policy` is
+        # already the role-account audit block written by verification_worker,
+        # and quietly overwriting an audit trail with a provider verdict would
+        # lose the record of what we decided and when.
+        "verification_provider": result.get("provider"),
+        "verification_policy": result.get("policy"),
+        "verification_policy_reason": result.get("policy_reason"),
+        "verification_policy_version": result.get("policy_version"),
         "cached": result.get("cached"),
         "took_ms": result.get("took_ms"),
         "error": scrub(result.get("error") or "") or None,

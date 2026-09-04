@@ -61,6 +61,23 @@ MAILBOX_RELEASES = (MAILBOX_VALID,)
 REASON_NO_MAILBOX_PROOF = "role_account_domain_only"
 REASON_MAILBOX_INVALID = "role_account_mailbox_invalid"
 REASON_CATCH_ALL = "role_account_catch_all"
+REASON_VERIFIER_POLICY = "role_account_verifier_policy"
+
+# The verifier worker's own admission verdict. Where it has one, it is
+# authoritative FOR ROLE ACCOUNTS and nothing else -- see the note on
+# `evaluate`. The mapping is deliberately not clever: the worker has looked at
+# more than we have, and second-guessing it is how a "release" becomes a send
+# to an address nobody confirmed.
+POLICY_RELEASE = "release"
+POLICY_HOLD = "hold"
+POLICY_RETRY = "retry"
+POLICY_REJECT = "reject"
+
+POLICY_STATUS = {
+    POLICY_HOLD: "risky",
+    POLICY_RETRY: "unknown",
+    POLICY_REJECT: "invalid",
+}
 
 # Published, front-of-house mailboxes. Mail sent here is expected.
 APPROVED = frozenset((
@@ -162,6 +179,17 @@ def is_free_provider(email: str) -> bool:
     return split(email)[1] in FREE_PROVIDERS
 
 
+def verifier_policy(record: Dict[str, Any]) -> str:
+    """The worker's admission verdict, or "" when it did not give one.
+
+    Absent means an older record written before the worker grew this field,
+    and the mailbox-evidence gate below decides instead.
+    """
+    value = str(record.get("verification_policy") or "").strip().lower()
+    return value if value in (POLICY_RELEASE, POLICY_HOLD, POLICY_RETRY,
+                              POLICY_REJECT) else ""
+
+
 def mailbox_evidence(record: Dict[str, Any]) -> Tuple[str, str]:
     """(verification_level, mailbox_status) as the verifier reported them.
 
@@ -253,6 +281,28 @@ def evaluate(email: str, record: Optional[Dict[str, Any]] = None,
     # An approved role word, clean on every other axis -- and still not enough.
     # The address is a guess until something has actually asked the receiving
     # server about this local part.
+    #
+    # Where the verifier worker has given its own verdict, that is the answer.
+    # It knows whether a deep provider is configured and we do not, so a
+    # `hold` from it while DEEP_PROVIDER is none is exactly right, and a
+    # `release` is the only thing that should ever open the gate.
+    #
+    # This runs ONLY for role accounts. A named address never reaches here:
+    # verification_worker consults this module only when role_account is the
+    # whole of the verifier's objection, so the worker's blanket `hold` on
+    # domain-only addresses cannot stop named outreach. That is a deliberate
+    # temporary compatibility rule for DEEP_PROVIDER=none, and it is asserted
+    # in test_verifier_policy -- revisit it when a deep provider is enabled.
+    decided = verifier_policy(record)
+    if decided and decided != POLICY_RELEASE:
+        out.update(status=POLICY_STATUS[decided],
+                   reason=REASON_VERIFIER_POLICY, eligible=False)
+        out["verifier_policy"] = decided
+        out["blockers"].append(
+            "verifier policy %s: %s"
+            % (decided, str(record.get("verification_policy_reason") or "")[:80]))
+        return out
+
     level, mailbox = mailbox_evidence(record)
     out["verification_level"] = level
     out["mailbox_status"] = mailbox
@@ -278,6 +328,8 @@ def evaluate(email: str, record: Optional[Dict[str, Any]] = None,
         return out
 
     out.update(status="valid", reason=REASON_ALLOWED, eligible=True)
+    if decided:
+        out["verifier_policy"] = decided
     return out
 
 
