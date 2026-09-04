@@ -2,21 +2,30 @@
 """A stage whose task finished without doing it must be offered again.
 
 Kanban resolves an idempotency key to whatever task already holds it, whatever
-state that task is in. So when an agent finished its turn without calling
-save_draft -- answered conversationally, or was reclaimed and completed having
-written nothing -- every later tick re-issued the key, received the finished
-task, created no worker, and the lead waited for ever. On 2026-09-04 that held
-48 leads in COPY_PENDING and 60 in QA_PENDING, and unlike a blocked task it
-left nothing on the board to show for it.
+state that task is in. So an agent that finishes its turn without calling
+save_draft -- answering conversationally, or completing after a reclaim having
+written nothing -- leaves a key that resolves to a finished task: every later
+tick re-issues it, receives that task, spawns no worker, and the lead waits for
+ever. Verified against the live board on 2026-09-04 by re-issuing the key for
+L-fcc2be1364e512e7, which returned t_8adaf392 with status=done and created
+nothing.
 
-Worth being precise about what is NOT the bug, because it was my first
-diagnosis and it was wrong: eight ARIA tasks sat in `running` for ten hours
-during the provider outage, and they were healthy. Their workers were alive,
-heartbeating every sixty seconds, crashing and being retried against a dead
-endpoint; all eight completed once the provider returned. Kanban's own
-detect_crashed_workers correctly left them alone, and a reaper that judged
-them by started_at would have killed live work mid-generation. The tests below
-encode that: a long-running task with a live worker is never disturbed.
+This closes that hole. It is a latent one: no lead was actually lost to it on
+the day. Two things that LOOKED like it were measurement errors of mine, and
+both are encoded below so they cannot be mistaken again.
+
+  * Eight ARIA tasks sat in `running` for ten hours during the provider
+    outage. They were healthy -- live workers, heartbeats every sixty seconds,
+    crashing and being retried against a dead endpoint -- and all eight
+    completed once the provider returned. Kanban's own detect_crashed_workers
+    correctly left them alone, and a reaper judging them by started_at would
+    have destroyed live work mid-generation.
+
+  * A "stranded" count built from missing output alone reported sixty leads on
+    a pipeline draining perfectly at five per stage per tick. A lead waiting
+    its turn looks identical on that test. Strandedness needs the second half:
+    the task for its CURRENT stage has stopped, so nothing is left to produce
+    the output.
 
 Nothing here spawns an agent, calls Kanban, or touches the network.
 """
@@ -228,17 +237,22 @@ def main() -> int:
             check("14. a lead with no task on the board yet is backlog",
                   "L-y" not in O.stranded_leads(con),
                   "the stage simply has not been reached")
-            O._task_statuses_by_lead = lambda ids: {"L-y": ["running"]}
+            O._task_statuses_by_lead = lambda ids: {"L-y": [("copy:0", "running")]}
             check("    a lead whose task is still running is not stranded",
                   "L-y" not in O.stranded_leads(con))
-            O._task_statuses_by_lead = lambda ids: {"L-y": ["done", "done"]}
+            O._task_statuses_by_lead = lambda ids: {"L-y": [("copy:0", "done")]}
             check("    output missing AND every task stopped is a strand",
                   "L-y" in O.stranded_leads(con))
-            O._task_statuses_by_lead = lambda ids: {"L-x": ["done"],
-                                                    "L-y": ["done"]}
+            O._task_statuses_by_lead = lambda ids: {
+                "L-x": [("copy:0", "done")], "L-y": [("copy:0", "done")]}
             check("    a lead that HAS its output never counts",
                   "L-x" not in O.stranded_leads(con),
                   "L-x holds a queued message from the checks above")
+            O._task_statuses_by_lead = lambda ids: {
+                "L-y": [("research", "done")]}
+            check("    a finished task from an earlier stage does not count",
+                  "L-y" not in O.stranded_leads(con),
+                  "a lead newly in QA_PENDING still carries a done copy task")
         finally:
             O._task_statuses_by_lead = real_tasks
 

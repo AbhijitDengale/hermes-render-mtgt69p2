@@ -769,9 +769,17 @@ def board_health() -> Dict[str, Any]:
     return out
 
 
-def _task_statuses_by_lead(lead_ids) -> Dict[str, List[str]]:
-    """Every kanban task status for each lead, in one pass over the board."""
-    out: Dict[str, List[str]] = {}
+# Which task key belongs to the stage a lead is waiting in. A lead that has
+# just reached QA_PENDING still carries finished research and copy tasks, so
+# asking whether ALL its tasks are terminal says yes about work that is not
+# the work it is waiting for.
+STAGE_TASK_PREFIX = {"RESEARCHING": "research", "COPY_PENDING": "copy",
+                     "QA_PENDING": "qa"}
+
+
+def _task_statuses_by_lead(lead_ids) -> Dict[str, List[tuple]]:
+    """(stage, status) for each lead's tasks, in one pass over the board."""
+    out: Dict[str, List[tuple]] = {}
     if not lead_ids:
         return out
     try:
@@ -782,10 +790,11 @@ def _task_statuses_by_lead(lead_ids) -> Dict[str, List[str]]:
         for key, status in con.execute(
                 "SELECT idempotency_key, status FROM tasks"
                 " WHERE idempotency_key LIKE 'agency:%'"):
-            # agency:<lead>:gen:<n>:<stage>
+            # agency:<lead>:gen:<n>:<stage>[:rescue:<n>]
             parts = (key or "").split(":")
-            if len(parts) > 1:
-                out.setdefault(parts[1], []).append((status or "").lower())
+            if len(parts) >= 5:
+                out.setdefault(parts[1], []).append(
+                    (parts[4], (status or "").lower()))
     except sqlite3.Error:
         pass
     con.close()
@@ -823,8 +832,10 @@ def stranded_leads(con, limit: int = 400) -> List[str]:
             missing = (not draft) if state == "COPY_PENDING"                 else (not draft or not draft["qa_status"])
         if not missing:
             continue
-        seen = tasks.get(lid) or []
-        # No task at all means the stage has not been dispatched yet, which is
+        prefix = STAGE_TASK_PREFIX.get(state)
+        seen = [st for stage, st in (tasks.get(lid) or [])
+                if prefix and stage.startswith(prefix)]
+        # No task for THIS stage means it has not been dispatched yet, which is
         # the tick's ordinary backlog, not a strand.
         if seen and all(st in TERMINAL_TASK_STATUSES for st in seen):
             out.append(lid)
