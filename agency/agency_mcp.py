@@ -292,7 +292,11 @@ def t_submit_verdict(a: Dict[str, Any]) -> Dict[str, Any]:
                         approval_id=str(res.get("id")))
             # Written in the same transaction as the verdict: an approval that
             # exists without the tenant it was filed under would be unusable.
-            con.execute("UPDATE messages SET tenant_user_id=? WHERE id=?",
+            # The time is recorded with the tenant so the allocator can share
+            # new work by how recently each tenant was given some, rather than
+            # inferring it from whenever the row happened to be touched.
+            con.execute("UPDATE messages SET tenant_user_id=?,"
+                        "       tenant_assigned_at=datetime('now') WHERE id=?",
                         (tenant["user_id"], draft["id"]))
     return {"recorded": "approved", "lead_id": lead_id,
             "approval_id": res.get("id"), "content_hash": res.get("content_hash")}

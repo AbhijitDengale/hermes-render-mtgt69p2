@@ -37,8 +37,73 @@ from typing import Any, Dict, List, Optional
 MAX_TENANTS = 32
 
 
+# A profile's .env is the source of truth for tenant credentials, but a
+# subprocess only receives the variables its config.yaml happens to name. That
+# whitelist was written when there were five tenants and is a second place the
+# tenant list has to be remembered; when four more were added it was not
+# updated, so the process that assigns leads could not see them and every new
+# lead went to the original five. The file is read here directly so that
+# adding a tenant to the .env is sufficient, whatever any whitelist says.
+_FILE_CACHE: Dict[str, Any] = {"path": None, "mtime": None, "values": {}}
+
+
+def _env_file_path() -> str:
+    """This profile's own .env.
+
+    HERMES_HOME when the process has it. An MCP subprocess does not: it
+    receives only the variables its config.yaml names, and HERMES_HOME is not
+    among them. AGENCY_ROLE is, and it identifies the profile -- which matters
+    because each profile's file holds only its own kind of credential:
+    SENTINEL the approve tokens, LEO the suppress tokens, root the queue
+    tokens. Reading the wrong file would find the tenant and none of its keys.
+    """
+    home = (os.getenv("HERMES_HOME", "") or "").strip()
+    if home:
+        return os.path.join(home, ".env")
+    role = (os.getenv("AGENCY_ROLE", "") or "").strip().lower()
+    if role and role not in ("root", "maya"):
+        return "/opt/data/profiles/%s/.env" % role
+    return "/opt/data/.env"
+
+
+def _env_file_values() -> Dict[str, str]:
+    """Tenant variables from this profile's .env, re-read when it changes.
+
+    Only MAILHUB_TENANT_* is taken. Nothing else in the file is imported, so
+    this cannot quietly hand a profile a credential it was not given.
+    """
+    path = _env_file_path()
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return {}
+    if _FILE_CACHE["path"] == path and _FILE_CACHE["mtime"] == mtime:
+        return _FILE_CACHE["values"]
+    values: Dict[str, str] = {}
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line.startswith("MAILHUB_TENANT_") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                values[key.strip()] = value.strip()
+    except OSError:
+        return _FILE_CACHE["values"]
+    _FILE_CACHE.update(path=path, mtime=mtime, values=values)
+    return values
+
+
 def _env(name: str) -> str:
-    return (os.getenv(name, "") or "").strip()
+    """The process environment first, then the profile's own .env file.
+
+    The environment wins so an operator can still override a single value
+    without editing the file.
+    """
+    value = (os.getenv(name, "") or "").strip()
+    if value:
+        return value
+    return (_env_file_values().get(name, "") or "").strip()
 
 
 def _first(*names: str) -> str:
@@ -146,22 +211,132 @@ def unavailable(con: Optional[sqlite3.Connection] = None) -> List[Dict[str, Any]
 
 # --- routing ----------------------------------------------------------------
 
+def capacity(con: sqlite3.Connection) -> Dict[int, Dict[str, Any]]:
+    """Per tenant: what it has sent and what it has left, from tenant_health.
+
+    tenant_health is what each profile recorded from MailHub, which is the
+    only place the real counters live. A tenant with no health row has no
+    known capacity and is treated as having none.
+    """
+    out: Dict[int, Dict[str, Any]] = {}
+    try:
+        rows = con.execute(
+            "SELECT user_id, daily_limit, sent_today, health,"
+            "       sender_identity_status FROM tenant_health").fetchall()
+    except sqlite3.Error:
+        return out
+    for r in rows:
+        d = dict(r)
+        limit = d.get("daily_limit") or 0
+        sent = d.get("sent_today") or 0
+        d["remaining"] = max(0, limit - sent)
+        out[d["user_id"]] = d
+    return out
+
+
+def _assignment_load(con: sqlite3.Connection) -> Dict[int, Dict[str, Any]]:
+    """How much work each tenant has been given, and when it was last given.
+
+    Counted from the messages this agency assigned rather than from what
+    MailHub has sent, because this is about sharing out NEW work: a message
+    assigned a minute ago has not been sent yet but has already been promised.
+    """
+    out: Dict[int, Dict[str, Any]] = {}
+    try:
+        rows = con.execute(
+            "SELECT tenant_user_id AS uid,"
+            "       COUNT(*) AS total,"
+            "       SUM(CASE WHEN COALESCE(tenant_assigned_at, updated_at) >="
+            "                strftime('%Y-%m-%d %H:00:00','now')"
+            "           THEN 1 ELSE 0 END) AS this_hour,"
+            "       MAX(COALESCE(tenant_assigned_at, updated_at)) AS last_at"
+            "  FROM messages WHERE tenant_user_id IS NOT NULL"
+            " GROUP BY tenant_user_id").fetchall()
+    except sqlite3.Error:
+        return out
+    for r in rows:
+        out[r["uid"]] = {"total": r["total"] or 0,
+                         "this_hour": r["this_hour"] or 0,
+                         "last_at": r["last_at"] or ""}
+    return out
+
+
+def allocate(lead_id: str, con: Optional[sqlite3.Connection] = None,
+             pool: Optional[List[Dict[str, Any]]] = None
+             ) -> Optional[Dict[str, Any]]:
+    """The tenant a NEW lead should go to: the least-used one that can send.
+
+    Least-used rather than hashed. A hash spreads work evenly across whatever
+    set it is given, which is fine until the set changes -- and when four
+    tenants were added, every lead already carried an assignment made from the
+    old set, so the newcomers stayed at zero and nothing corrected it. Sharing
+    by current load is self-correcting: a tenant that is behind is chosen until
+    it catches up, which is exactly what is wanted after one joins.
+
+    Order: fewest assigned this hour, then fewest sent today, then longest
+    since it was last given work, then tenant id. The last key makes the
+    result deterministic, so the same state always produces the same choice
+    and a test can assert on it.
+
+    Capacity is part of the filter, not the score: a tenant with nothing left
+    today cannot be chosen at all, however far behind it is.
+    """
+    usable = ready(con, pool)
+    if not usable:
+        return None
+    if con is None:
+        # No database to reason about load with. Fall back to the hash, which
+        # at least spreads deterministically.
+        digest = hashlib.sha256(lead_id.encode("utf-8")).digest()
+        return usable[int.from_bytes(digest[:8], "big") % len(usable)]
+
+    cap = capacity(con)
+    load = _assignment_load(con)
+    affordable = [t for t in usable
+                  if cap.get(t["user_id"], {}).get("remaining", 0) > 0]
+    # If every tenant is out of capacity for today, fall back to the full
+    # ready set rather than refusing to route: the send path enforces the
+    # limit itself, and refusing here would strand the lead instead.
+    candidates = affordable or usable
+
+    # The last key is the lead's own hash rather than the tenant id. With the
+    # load keys level -- which is every tenant's state before any work is
+    # assigned -- an id tie-break would hand every lead to the same tenant
+    # until something was recorded, so a caller that asked without persisting
+    # would pile the lot onto one sender. Hashing spreads those ties the way
+    # the previous allocator did, while staying deterministic for a given
+    # lead: the same lead in the same state always gets the same tenant.
+    def spread(uid) -> bytes:
+        """Rendezvous hash: one digest per (lead, tenant) pair.
+
+        Arithmetic on a single per-lead number does not work here. `(digest +
+        uid) % n` looked like a permutation but collides whenever two tenant
+        ids are congruent mod n -- with seven candidates, ids 9 and 2 share a
+        slot and the lower id always won, so two tenants could never take a
+        tie at all. Hashing the pair gives every tenant an independent draw.
+        """
+        return hashlib.sha256(("%s:%s" % (lead_id, uid)).encode("utf-8")).digest()
+
+    def key(t):
+        uid = t["user_id"]
+        l = load.get(uid, {})
+        c = cap.get(uid, {})
+        return (l.get("this_hour", 0), c.get("sent_today", 0) or 0,
+                l.get("last_at", ""), spread(uid), uid or 0)
+
+    return sorted(candidates, key=key)[0]
+
+
 def for_lead(lead_id: str, con: Optional[sqlite3.Connection] = None,
              pool: Optional[List[Dict[str, Any]]] = None
              ) -> Optional[Dict[str, Any]]:
     """The tenant a NEW lead should go to, or None if none are usable.
 
-    Hashed rather than round-robin: a counter would need shared state and would
-    hand the same lead to a different tenant after a restart. Once a lead has
-    been approved its tenant is read from the message row instead -- see
-    for_message -- so a change in the ready set never moves work that is
-    already under way.
+    Once a lead has been approved its tenant is read from the message row
+    instead -- see for_message -- so a change in the ready set never moves
+    work that is already under way.
     """
-    usable = ready(con, pool)
-    if not usable:
-        return None
-    digest = hashlib.sha256(lead_id.encode("utf-8")).digest()
-    return usable[int.from_bytes(digest[:8], "big") % len(usable)]
+    return allocate(lead_id, con, pool)
 
 
 def for_message(persisted_user_id: Optional[int], lead_id: str,
