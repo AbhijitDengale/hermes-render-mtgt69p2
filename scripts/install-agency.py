@@ -65,6 +65,12 @@ CRON_JOBS = {
     # Discord embed cards (orbit_embeds). Letting the cron deliver stdout would
     # post the plaintext a second time, wrapped in a "Cronjob Response" header.
     "orbit-daily": (HERMES_HOME, "0 8 * * *", "orbit_daily.py", "local"),
+    # Watches the Discord credential so a token rotation no longer needs a
+    # redeploy. Cheap when healthy (two file reads, no network) and silent
+    # unless something changes -- see agency/discord_health.py for why this
+    # lives on the disk rather than as a patch to the gateway.
+    "discord-watchdog": (HERMES_HOME, "every 5m", "discord_watchdog.py",
+                         "local"),
 }
 # The alerts job runs from the root profile deliberately: Discord is
 # configured there and nowhere else, so a job scheduled on a sub-profile
@@ -78,9 +84,11 @@ WRAPPERS = {
     "review_alerts.py": HERMES_HOME / "scripts",
     "supabase_lead_sync.py": HERMES_HOME / "scripts",
     "orbit_daily.py": HERMES_HOME / "scripts",
+    "discord_watchdog.py": HERMES_HOME / "scripts",
 }
 
-MODULES = ("pipeline.py", "lead_ingest.py", "orchestrator.py", "followups.py",
+MODULES = ("credentials.py", "discord_health.py",
+           "pipeline.py", "lead_ingest.py", "orchestrator.py", "followups.py",
            "inbound_processor.py", "echo_tick.py", "review.py",
            "review_tick.py", "orbit.py", "orbit_embeds.py", "agency_mcp.py",
            "research_mcp.py",

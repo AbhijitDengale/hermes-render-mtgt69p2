@@ -14,19 +14,22 @@ reposting the same queue all day.
 """
 
 import os
+import pathlib
 import sys
 
 sys.path.insert(0, "/opt/data/agency")
 os.environ.setdefault("AGENCY_DB", "/opt/data/agency.db")
 
+import credentials as C  # noqa: E402
+
 # The Discord token lives in the root env this job already runs in and is
-# never printed.
-for _line in open("/opt/data/.env", encoding="utf-8"):
-    _k, _sep, _v = _line.partition("=")
-    if _sep and _k.strip() in ("DISCORD_BOT_TOKEN", "REVIEW_ALERTS_DISCORD_CHANNEL",
-                               "AGENCY_DISCORD_ALERTS_CHANNEL", "SUPABASE_URL",
-                               "SUPABASE_SECRET_KEY"):
-        os.environ.setdefault(_k.strip(), _v.strip())
+# never printed. Loaded through the shared resolver rather than a local parse
+# loop: the gateway and this job must not disagree about where the current
+# token is, which is exactly how the interactive bot stayed dead for fifteen
+# hours after the 2026-09-04 rotation while these cards kept posting.
+C.export(("DISCORD_BOT_TOKEN", "REVIEW_ALERTS_DISCORD_CHANNEL",
+          "AGENCY_DISCORD_ALERTS_CHANNEL", "SUPABASE_URL",
+          "SUPABASE_SECRET_KEY"), home=pathlib.Path("/opt/data"))
 
 import pipeline as P        # noqa: E402
 import review_cards as RC   # noqa: E402

@@ -22,18 +22,17 @@ import os
 import pathlib
 import sys
 
-ENV = pathlib.Path("/opt/data/profiles/orbit/.env")
+sys.path.insert(0, "/opt/data/agency")
+
+import credentials as C  # noqa: E402
 
 # Only the two variables the report needs, and only if the process does not
 # already carry them. Loading the whole file would import unrelated secrets.
-if ENV.exists():
-    for line in ENV.read_text(encoding="utf-8").splitlines():
-        key, sep, value = line.partition("=")
-        key = key.strip()
-        if sep and key in ("MAILHUB_BASE_URL", "MAILHUB_API_TOKEN"):
-            os.environ.setdefault(key, value.strip())
+# Resolution goes through the shared helper so this job and the gateway can
+# never drift apart on where a credential currently lives.
+C.export(("MAILHUB_BASE_URL", "MAILHUB_API_TOKEN"),
+         home=pathlib.Path("/opt/data/profiles/orbit"))
 
-sys.path.insert(0, "/opt/data/agency")
 os.environ.setdefault("AGENCY_DB", "/opt/data/agency.db")
 
 import orbit  # noqa: E402
@@ -47,12 +46,9 @@ print(orbit.report(metrics))
 # this job already runs in and is never printed. A failure here is reported on
 # stdout and never raises, so the log above is not lost with it.
 try:
-    for line in open("/opt/data/.env", encoding="utf-8"):
-        key, sep, value = line.partition("=")
-        if sep and key.strip() in ("DISCORD_BOT_TOKEN", "SUPABASE_URL",
-                                   "SUPABASE_SECRET_KEY", "NO_EMAIL_DISCORD_CHANNEL",
-                                   "ORBIT_REPORT_DISCORD_CHANNEL"):
-            os.environ.setdefault(key.strip(), value.strip())
+    C.export(("DISCORD_BOT_TOKEN", "SUPABASE_URL", "SUPABASE_SECRET_KEY",
+              "NO_EMAIL_DISCORD_CHANNEL", "ORBIT_REPORT_DISCORD_CHANNEL"),
+             home=pathlib.Path("/opt/data"))
     import no_email_report as NE
     import orbit_embeds as OE
     import pipeline as P
