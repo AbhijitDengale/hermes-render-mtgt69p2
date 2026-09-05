@@ -40,10 +40,24 @@ RUN chown -R hermes:hermes /opt/hermes/ui-tui /opt/hermes/node_modules \
 # in the upstream image). The import check fails the build early rather than
 # shipping an image where memory quietly does not work.
 #
-# Add providers here as needed, e.g. "honcho-ai supermemory".
-ARG MEMORY_PACKAGES="honcho-ai"
-RUN VIRTUAL_ENV=/opt/hermes/.venv uv pip install --no-cache ${MEMORY_PACKAGES} \
- && /opt/hermes/.venv/bin/python3 -c "import honcho; print('memory client OK: honcho-ai')"
+# EMPTY ON PURPOSE. This deployment runs Hermes' built-in memory only
+# (memory.provider: "" -> MEMORY.md / USER.md under each profile's
+# HERMES_HOME). Honcho was removed on 2026-09-05: the SDK is no longer
+# installed and nothing imports it. The plugin still ships with Hermes, and
+# both of its `from honcho import ...` statements sit inside `if TYPE_CHECKING:`
+# blocks, so its absence is inert -- verified by hiding the package and running
+# a real write/recall turn, `hermes memory status` and the watchdog suite, all
+# of which passed.
+#
+# To adopt a provider later: set MEMORY_PACKAGES (e.g. "honcho-ai"), set
+# memory.provider in config.yaml, and supply its key.
+ARG MEMORY_PACKAGES=""
+RUN if [ -n "${MEMORY_PACKAGES}" ]; then \
+      VIRTUAL_ENV=/opt/hermes/.venv uv pip install --no-cache ${MEMORY_PACKAGES}; \
+      echo "memory client(s) installed: ${MEMORY_PACKAGES}"; \
+    else \
+      echo "no external memory provider: built-in MEMORY.md/USER.md only"; \
+    fi
 
 # Pull the official Render skill bundle from github.com/render-oss/skills
 # at a pinned commit. Mounted via skills.external_dirs at boot, so the
