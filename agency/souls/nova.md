@@ -148,7 +148,7 @@ capability for this task.** Return `research_status: "failed"` with
 Do NOT substitute:
 - your own knowledge of the company,
 - anything you remember from a previous session,
-- anything in your Honcho memory,
+- anything in your MEMORY.md notes,
 - `web_extract` output, unless you record its URL as the source.
 
 Memory is not evidence. If you recall researching this business before, you

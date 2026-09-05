@@ -63,6 +63,7 @@ except ImportError:  # running from a checkout rather than /opt/data/agency
 
 __all__ = [
     "DISCONNECTED", "CONNECTING", "HEALTHY", "AUTH_FAILED", "TEMPORARY_FAILURE",
+    "NEEDS_MANUAL_RESTART",
     "ACT_NOTHING", "ACT_VALIDATE", "ACT_RESTART", "ACT_REPORT_RECOVERY",
     "classify", "decide", "validate_token", "read_gateway_state",
     "load_state", "save_state", "request_gateway_restart", "tick",
@@ -74,6 +75,15 @@ CONNECTING = "CONNECTING"
 HEALTHY = "HEALTHY"
 AUTH_FAILED = "AUTH_FAILED"
 TEMPORARY_FAILURE = "TEMPORARY_FAILURE"
+# The credential was fixed and validated, the restart was requested, and the
+# gateway did not restart. Observed on 2026-09-05: pid 164 consumed SIGUSR1,
+# SIGTERM and `hermes gateway restart` without acting, because
+# GatewayRunner.request_restart() returns early forever once
+# ``_restart_task_started`` is set -- so a process that was asked to restart
+# once and did not complete it can never be restarted in-band again. Signals
+# are delivered and consumed (SigPnd stays 0), which is precisely why this
+# has to be verified rather than assumed.
+NEEDS_MANUAL_RESTART = "NEEDS_MANUAL_RESTART"
 
 # ── what a tick may do ──────────────────────────────────────────────────────
 ACT_NOTHING = "nothing"
@@ -90,8 +100,17 @@ BACKOFF_BASE_SECONDS = 300
 BACKOFF_CAP_SECONDS = 3600
 
 # A restart we asked for but have not yet seen take effect. Prevents a second
-# signal every tick while the gateway is still draining.
-RESTART_GRACE_SECONDS = 180
+# signal every tick while the gateway is still draining. Generous because an
+# in-band restart waits for active work first: agent.restart_after_turn_timeout
+# defaults to 1800s, and a cron run that takes six minutes (maya-orchestrator
+# does) sits inside that window. Signalling again during a legitimate drain
+# would be noise at best.
+RESTART_GRACE_SECONDS = 600
+
+# After this long with the SAME gateway pid still serving a failed Discord, the
+# restart demonstrably did not happen and no amount of further signalling will
+# change that. Escalate to the operator instead of retrying forever.
+RESTART_VERIFY_DEADLINE_SECONDS = 1800
 
 
 def state_path(home: Optional[pathlib.Path] = None) -> pathlib.Path:
@@ -178,12 +197,18 @@ def save_state(data: Dict[str, Any], path: Optional[pathlib.Path] = None) -> Non
 # ── the decision (pure: no clock, no network, no disk) ──────────────────────
 
 def decide(state: Dict[str, Any], observed: str, fingerprint: str,
-           now: float) -> Tuple[str, str]:
+           now: float, gateway_pid: int = 0) -> Tuple[str, str]:
     """Return ``(action, reason)`` for this tick.
 
     Pure by construction so the whole policy — including the "do not hammer"
     rule, which is the part that would get a bot banned if it regressed — is
     testable without a network, a clock, or a gateway.
+
+    ``gateway_pid`` is how a requested restart is *verified*. Asking is not the
+    same as happening: this deployment has a gateway that consumes the signal
+    and stays up (see NEEDS_MANUAL_RESTART), and a watchdog that assumes its
+    own success is worse than none, because it reports healthy while the bot
+    is still dead.
     """
     if observed == HEALTHY:
         if state.get("incident_open") and not state.get("recovery_reported"):
@@ -202,8 +227,21 @@ def decide(state: Dict[str, Any], observed: str, fingerprint: str,
         return ACT_NOTHING, "no credential configured"
 
     pending = float(state.get("restart_requested_at") or 0)
-    if pending and now - pending < RESTART_GRACE_SECONDS:
-        return ACT_NOTHING, "restart already requested %ds ago" % int(now - pending)
+    if pending:
+        waited = now - pending
+        same_pid = gateway_pid and gateway_pid == int(state.get("restart_pid") or 0)
+        if waited < RESTART_GRACE_SECONDS:
+            return ACT_NOTHING, "restart requested %ds ago, still draining" % int(waited)
+        if same_pid and waited >= RESTART_VERIFY_DEADLINE_SECONDS:
+            # Same process, well past any legitimate drain. The signal did not
+            # take. Say so, loudly and permanently, rather than signalling into
+            # a void every five minutes.
+            return ACT_NOTHING, (
+                "RESTART DID NOT TAKE EFFECT — gateway pid %d unchanged after "
+                "%dm. Discord needs a manual gateway/container restart; the "
+                "credential itself is valid." % (gateway_pid, int(waited // 60)))
+        if same_pid:
+            return ACT_NOTHING, "restart requested %dm ago, pid unchanged" % int(waited // 60)
 
     if fingerprint in (state.get("rejected_fingerprints") or []):
         # THE central rule. Discord already told us this exact credential is
@@ -298,7 +336,8 @@ def tick(*, home: Optional[pathlib.Path] = None, now: Optional[float] = None,
     observed, code = classify(gw)
     state = load_state(state_path(home))
 
-    action, reason = decide(state, observed, fp, now)
+    gateway_pid = int(gw.get("pid") or 0)
+    action, reason = decide(state, observed, fp, now, gateway_pid)
     out: Dict[str, Any] = {
         "observed": observed, "error_code": code, "fingerprint": fp,
         "action": action, "reason": reason, "credential_present": bool(token),
@@ -311,15 +350,16 @@ def tick(*, home: Optional[pathlib.Path] = None, now: Optional[float] = None,
             out["changed"] = True
         state.update(state=HEALTHY, incident_open=False, recovery_reported=True,
                      validation_failures=0, next_probe_after=0,
-                     restart_requested_at=0, healthy_fingerprint=fp,
-                     last_healthy_at=now)
+                     restart_requested_at=0, restart_pid=0,
+                     healthy_fingerprint=fp, last_healthy_at=now)
     else:
         if observed == AUTH_FAILED and not state.get("incident_open"):
             state.update(incident_open=True, recovery_reported=False,
                          incident_opened_at=now, incident_fingerprint=fp)
             out["incident_opened"] = True
             out["changed"] = True
-        state["state"] = observed
+        state["state"] = (NEEDS_MANUAL_RESTART
+                          if "DID NOT TAKE EFFECT" in reason else observed)
 
     if action == ACT_VALIDATE:
         status, username, user_id = validator(token)
@@ -334,7 +374,8 @@ def tick(*, home: Optional[pathlib.Path] = None, now: Optional[float] = None,
             out["changed"] = True
             if ok:
                 state.update(restart_requested_at=now, validation_failures=0,
-                             next_probe_after=0, validated_fingerprint=fp)
+                             next_probe_after=0, validated_fingerprint=fp,
+                             restart_pid=int(gw.get("pid") or 0))
         elif status in (401, 403):
             rejected = list(state.get("rejected_fingerprints") or [])
             if fp not in rejected:
@@ -378,6 +419,8 @@ def format_line(result: Dict[str, Any]) -> str:
         bits.append("RECOVERED")
     if result.get("incident_opened"):
         bits.append("INCIDENT OPENED")
+    if "DID NOT TAKE EFFECT" in result.get("reason", ""):
+        bits.append("*** NEEDS MANUAL RESTART ***")
     bits.append("(%s)" % result["reason"])
     return " ".join(bits)
 

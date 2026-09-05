@@ -81,6 +81,10 @@ def never_called(*a, **k):
     raise AssertionError("must not be called")
 
 
+def fake_restart_ok(pid):
+    return True, "SIGUSR1 sent to pid %d" % pid
+
+
 def main() -> int:
     print("=" * 82)
     print("DISCORD WATCHDOG: recover on rotation, never retry a rejected credential")
@@ -157,7 +161,7 @@ def main() -> int:
           "never restart on an unvalidated credential")
     r2 = run(h, 5060.0, never_called, never_called)
     check("   a second tick inside the grace window does NOT re-signal",
-          r2["action"] == DH.ACT_NOTHING and "restart already requested" in r2["reason"],
+          r2["action"] == DH.ACT_NOTHING and "still draining" in r2["reason"],
           r2["reason"])
     (h / "gateway_state.json").write_text(json.dumps({
         "pid": 4242, "gateway_state": "running",
@@ -257,6 +261,40 @@ def main() -> int:
           DH.state_path(pathlib.Path("/opt/data")).as_posix() ==
           "/opt/data/state/discord_health.json",
           DH.state_path(pathlib.Path("/opt/data")).as_posix())
+
+    print("\n--- 13. asking for a restart is not the same as getting one ---")
+    # This deployment's gateway consumed SIGUSR1, SIGTERM and `hermes gateway
+    # restart` and stayed up: request_restart() returns early forever once
+    # _restart_task_started is set. A watchdog that assumed its own success
+    # would report healthy while the bot was still dead, which is worse than
+    # not having one.
+    h = home_with(FAKE_NEW, "fatal", "discord_auth_error", pid=4242)
+    r = run(h, 1000.0, lambda t: (200, "Maya", "1"), fake_restart_ok)
+    check("13. a validated credential requests a restart",
+          r["action"] == DH.ACT_RESTART and r["restart_ok"] is True)
+    st = DH.load_state(DH.state_path(h))
+    check("    the signalled pid is recorded, so it can be verified later",
+          st.get("restart_pid") == 4242, str(st.get("restart_pid")))
+    a, why = DH.decide(st, DH.AUTH_FAILED, C.fingerprint(FAKE_NEW), 1000.0 + 120, 4242)
+    check("    inside the drain window it stays quiet",
+          a == DH.ACT_NOTHING and "draining" in why, why)
+    a, why = DH.decide(st, DH.AUTH_FAILED, C.fingerprint(FAKE_NEW), 1000.0 + 900, 4242)
+    check("    past the grace window but not the deadline: still quiet",
+          a == DH.ACT_NOTHING and "pid unchanged" in why, why)
+    a, why = DH.decide(st, DH.AUTH_FAILED, C.fingerprint(FAKE_NEW), 1000.0 + 2000, 4242)
+    check("    past the deadline with the SAME pid -> escalates to a human",
+          a == DH.ACT_NOTHING and "DID NOT TAKE EFFECT" in why, why[:60])
+    r = run(h, 1000.0 + 2000, never_called, never_called)
+    check("    the escalation is persisted as NEEDS_MANUAL_RESTART",
+          DH.load_state(DH.state_path(h))["state"] == DH.NEEDS_MANUAL_RESTART)
+    check("    and shouted in the cron log line",
+          "*** NEEDS MANUAL RESTART ***" in DH.format_line(r))
+    check("    it never re-signals into the void",
+          r["action"] == DH.ACT_NOTHING,
+          "the signal provably does nothing; repeating it is not a strategy")
+    a, why = DH.decide(st, DH.AUTH_FAILED, C.fingerprint(FAKE_NEW), 1000.0 + 2000, 9999)
+    check("    a NEW pid past the deadline is NOT an escalation",
+          "DID NOT TAKE EFFECT" not in why, why[:52])
 
     print("\n--- extra: states that are not ours to act on ---")
     h = home_with(FAKE_NEW, "retrying", "discord_connect_error")
