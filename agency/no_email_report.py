@@ -42,7 +42,12 @@ DISCORD_HARD_LIMIT = 2000
 PART_TARGET = int(os.getenv("NO_EMAIL_PART_CHARS", "1800"))
 
 DISCORD_API = "https://discord.com/api/v10"
-CHANNEL_ID = os.getenv("NO_EMAIL_DISCORD_CHANNEL", "1484778503529304145")  # #maya-office
+import discord_routing as _routing
+
+# No-email leads are lead data, not a conversation with the operator, so they
+# belong in #sales-leads. This used to default to #maya-office, which is how a
+# 554-lead CSV landed in the channel meant for talking to MAYA.
+CHANNEL_ID = _routing.channel("sales_leads")
 
 FIELDS = ("id,email,external_lead_id,business_name,business_type,niche,area_locality,"
           "address,city,region,country,phone,whatsapp,website,google_maps_url,"
@@ -387,6 +392,12 @@ def build(day: str, leads: Optional[List[Dict[str, Any]]] = None) -> Dict[str, A
 def post_all(con: sqlite3.Connection, built: Dict[str, Any],
              channel: str = CHANNEL_ID, send=None) -> Dict[str, Any]:
     """Deliver header, summary, every part, and the CSV -- resumably.
+    # An unresolved route means "do not post". Falling back to a default
+    # channel would put sales data somewhere nobody is reading, which is the
+    # failure this routing table exists to end.
+    if not channel:
+        return {"parts": 0, "sent": 0, "skipped": 0, "failed": 0,
+                "unrouted": True}
 
     Part 0 is the header+summary, parts 1..N the cards, part N+1 the CSV.
     Each is skipped if the ledger already shows it delivered today with the

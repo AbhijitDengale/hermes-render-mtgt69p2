@@ -51,9 +51,12 @@ COLOR = {
     "neutral": 0x95A5A6,    # grey   -- no action likely
 }
 
-CHANNEL_ID = os.getenv("REVIEW_ALERTS_DISCORD_CHANNEL",
-                       os.getenv("AGENCY_DISCORD_ALERTS_CHANNEL",
-                                 "1484778510383054898"))          # #alerts
+import discord_routing as _routing
+
+# The human-review queue is work waiting on a person, which is a different
+# thing from an operational incident: #sales-review, not #alerts. Delivery
+# failure OF the review cards is the incident, and belongs in #sales-alerts.
+CHANNEL_ID = _routing.channel("sales_review")
 
 # One row per review type: the title it gets, its accent colour, whether a
 # reply is a sensible thing to draft, and which actions apply to it.
@@ -427,6 +430,12 @@ def post(con: sqlite3.Connection, rows: Optional[List[Dict[str, Any]]] = None,
          channel: str = CHANNEL_ID, send: Optional[Callable] = None,
          edit: Optional[Callable] = None) -> Dict[str, Any]:
     """Post what is new, edit what changed, leave the rest alone."""
+    # An unresolved route means "do not post". Falling back to a default
+    # channel would put sales data somewhere nobody is reading, which is the
+    # failure this routing table exists to end.
+    if not channel:
+        return {"pending": 0, "new": 0, "updated": 0, "unchanged": 0,
+                "failed": 0, "digest": False, "unrouted": True}
     import no_email_report as NE
     send = send or NE._discord
     # The same transport: _discord takes the method, so a PATCH to an existing

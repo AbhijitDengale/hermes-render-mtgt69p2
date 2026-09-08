@@ -61,8 +61,10 @@ COLOR = {
 
 SECTION = "orbit_embeds"    # ledger section, distinct from the old plaintext parts
 DISCORD_API = "https://discord.com/api/v10"
-CHANNEL_ID = os.getenv("ORBIT_REPORT_DISCORD_CHANNEL",
-                       os.getenv("NO_EMAIL_DISCORD_CHANNEL", "1484778503529304145"))
+import discord_routing as _routing
+
+# The daily report is analytics, not correspondence.
+CHANNEL_ID = _routing.channel("sales_analytics")
 POST_GAP_SECONDS = float(os.getenv("ORBIT_EMBED_POST_GAP", "1.1"))
 
 JOB_LABELS = {
@@ -883,6 +885,12 @@ def post_all(con: sqlite3.Connection, messages: List[Dict[str, Any]], day: str,
     failure stops the run so ordering is preserved; the next run continues
     from that part without resending what landed.
     """
+    # An unresolved route means "do not post". Falling back to a default
+    # channel would put sales data somewhere nobody is reading, which is the
+    # failure this routing table exists to end.
+    if not channel:
+        return {"parts": len(messages), "sent": 0, "skipped": 0,
+                "failed": 0, "unrouted": True}
     import no_email_report as NE
     send = send or NE._discord
     total = len(messages)
