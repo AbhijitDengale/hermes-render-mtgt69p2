@@ -87,7 +87,7 @@ WRAPPERS = {
     "discord_watchdog.py": HERMES_HOME / "scripts",
 }
 
-MODULES = ("credentials.py", "discord_health.py",
+MODULES = ("credentials.py", "discord_health.py", "discord_routing.py",
            "pipeline.py", "lead_ingest.py", "orchestrator.py", "followups.py",
            "inbound_processor.py", "echo_tick.py", "review.py",
            "review_tick.py", "orbit.py", "orbit_embeds.py", "agency_mcp.py",
