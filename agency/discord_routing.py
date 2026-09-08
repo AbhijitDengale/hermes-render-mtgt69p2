@@ -62,6 +62,9 @@ ROUTES: Dict[str, dict] = {
     "sales_analytics": {
         "env": "SALES_ANALYTICS_CHANNEL", "legacy": ("ORBIT_REPORT_DISCORD_CHANNEL",),
         "default": "", "desc": "ORBIT daily report + analytics"},
+    "sales_mailboxes": {
+        "env": "SALES_MAILBOXES_CHANNEL", "legacy": (),
+        "default": "", "desc": "sender health + operator pause/resume console"},
     # Pre-existing channels, kept addressable so nothing has to hardcode them.
     "maya_office": {
         "env": "MAYA_OFFICE_CHANNEL", "legacy": (),

@@ -71,6 +71,9 @@ CRON_JOBS = {
     # lives on the disk rather than as a patch to the gateway.
     "discord-watchdog": (HERMES_HOME, "every 5m", "discord_watchdog.py",
                          "local"),
+    # The operator's pause/resume console for the sending mailboxes. Posts a
+    # card only when the fleet changes, and consumes typed commands once.
+    "mailbox-console": (HERMES_HOME, "every 2m", "mailbox_console.py", "local"),
 }
 # The alerts job runs from the root profile deliberately: Discord is
 # configured there and nowhere else, so a job scheduled on a sub-profile
@@ -85,9 +88,11 @@ WRAPPERS = {
     "supabase_lead_sync.py": HERMES_HOME / "scripts",
     "orbit_daily.py": HERMES_HOME / "scripts",
     "discord_watchdog.py": HERMES_HOME / "scripts",
+    "mailbox_console.py": HERMES_HOME / "scripts",
 }
 
 MODULES = ("credentials.py", "discord_health.py", "discord_routing.py",
+           "mailbox_console.py",
            "pipeline.py", "lead_ingest.py", "orchestrator.py", "followups.py",
            "inbound_processor.py", "echo_tick.py", "review.py",
            "review_tick.py", "orbit.py", "orbit_embeds.py", "agency_mcp.py",

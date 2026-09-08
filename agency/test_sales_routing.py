@@ -40,6 +40,7 @@ IDS = {
     "sales_review":    "1546762329448779786",
     "sales_alerts":    "1546762332884172800",
     "sales_analytics": "1546762336692473947",
+    "sales_mailboxes": "1546767805288816670",
 }
 MAYA_OFFICE = "1484778503529304145"
 GLOBAL_ALERTS = "1484778510383054898"
@@ -84,11 +85,11 @@ def main() -> int:
 
     print("\n--- 15. the config resolves all seven SALES channels ---")
     resolved = {r: R.channel(r, home=home) for r in R.SALES_ROUTES}
-    check("15. seven sales routes defined", len(R.SALES_ROUTES) == 7, str(len(R.SALES_ROUTES)))
+    check("15. eight sales routes defined", len(R.SALES_ROUTES) == 8, str(len(R.SALES_ROUTES)))
     check("    every one resolves to an id", all(resolved.values()),
           str([r for r, v in resolved.items() if not v]) or "all resolved")
     check("    ids are distinct — no two routes share a channel",
-          len(set(resolved.values())) == 7, str(len(set(resolved.values()))))
+          len(set(resolved.values())) == 8, str(len(set(resolved.values()))))
 
     print("\n--- 1-3, 5. each producer's destination ---")
     for route, label, num in (("sales_leads", "no-email report + CSV", "1-2"),
