@@ -163,6 +163,73 @@ def main() -> int:
           MC.load_state(home)["last_command_message_id"] == "12345",
           "so `resume t9` from three days ago is never replayed")
 
+    print("\n--- 8. the global brake ---")
+    import outreach_brake as OB
+    bh = pathlib.Path(tempfile.mkdtemp(prefix="brake-"))
+    check("8. a fresh install is RUNNING, not stopped",
+          OB.stopped(bh) is False, "no state file = never stopped")
+    r = OB.stop("bounce spike", by="bhavesh", home=bh)
+    check("   stop records who and why",
+          OB.stopped(bh) and r["reason"] == "bounce spike" and r["by"] == "bhavesh")
+    check("   stopping twice is a no-op",
+          OB.stop("again", home=bh)["changed"] is False,
+          "and does not overwrite the original reason")
+    check("   it survives a restart (state is on disk)",
+          OB.state(bh)["reason"] == "bounce spike")
+    check("   start clears it", OB.start(by="bhavesh", home=bh)["changed"] is True
+          and OB.stopped(bh) is False)
+    check("   starting twice is a no-op", OB.start(home=bh)["changed"] is False)
+
+    OB.state_path(bh).write_text("{ this is not json", encoding="utf-8")
+    check("   a CORRUPT state file reads as STOPPED, not running",
+          OB.stopped(bh) is True,
+          "guessing 'running' on a damaged brake would resume sending")
+    OB.state_path(bh).unlink()
+
+    print("\n--- 9. stop/start is not the same switch as pause/resume ---")
+    check("9. `stop t9` is refused — it reads both ways",
+          MC.parse_command("stop t9") is None)
+    check("   `stop outreach <reason>` parses with the reason",
+          MC.parse_command("stop outreach bounce spike") ==
+          {"verb": "stop_outreach", "reason": "bounce spike"})
+    check("   `start outreach` parses", MC.parse_command("start outreach")["verb"] == "start_outreach")
+    for text in ("should we stop outreach?", "stopping outreach now", "start"):
+        check("   %-30r is chat, not a command" % text[:30],
+              (MC.parse_command(text) or {}).get("verb") not in
+              ("stop_outreach", "start_outreach"))
+
+    print("\n--- 10. stopping outreach leaves every other brake alone ---")
+    con2 = db()
+    paused_before = con2.execute("SELECT paused_until FROM tenant_health WHERE user_id=9").fetchone()[0]
+    import os
+    os.environ["HERMES_HOME"] = str(bh)
+    MC.apply_command(con2, MC.parse_command("stop outreach test"), actor="tester")
+    paused_after = con2.execute("SELECT paused_until FROM tenant_health WHERE user_id=9").fetchone()[0]
+    active_after = con2.execute("SELECT paused_until FROM tenant_health WHERE user_id=2").fetchone()[0]
+    check("10. a paused mailbox stays paused", paused_before == paused_after)
+    check("    an active mailbox is NOT paused by the global stop",
+          active_after is None,
+          "stop halts queueing; it does not rewrite per-sender state")
+    ev = con2.execute("SELECT event_type, agent FROM events ORDER BY id DESC LIMIT 1").fetchone()
+    check("    the stop is audited with who did it",
+          ev["event_type"] == "outreach.stop" and ev["agent"] == "tester")
+    MC.apply_command(con2, MC.parse_command("start outreach"), actor="tester")
+    check("    starting again does not un-pause t9",
+          con2.execute("SELECT paused_until FROM tenant_health WHERE user_id=9").fetchone()[0]
+          == paused_before,
+          "lifting one brake must never lift another")
+
+    print("\n--- 11. the send path actually honours the brake ---")
+    src = (HERE / "orchestrator.py").read_text(encoding="utf-8")
+    check("11. queue_and_send checks the brake",
+          "brake = OB.state()" in src and 'holding, outreach stopped' in src)
+    check("    and HOLDS rather than transitioning the lead",
+          'return ("READY_TO_SEND: holding, outreach stopped' in src,
+          "a stopped lead keeps its place, so starting resumes not restarts")
+    check("    the check sits before the per-sender pause",
+          src.index("brake = OB.state()") < src.index("stood_down = tenants.is_paused"))
+    os.environ.pop("HERMES_HOME", None)
+
     print("\n--- 7. the rendered card ---")
     embed = MC.render(MC.snapshot(con))
     body = str(embed)

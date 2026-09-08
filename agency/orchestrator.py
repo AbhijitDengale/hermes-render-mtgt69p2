@@ -35,6 +35,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import followups as F  # noqa: E402
 import pipeline as P   # noqa: E402
 import tenants        # noqa: E402
+import outreach_brake as OB  # noqa: E402
 
 HERMES = os.getenv("HERMES_BIN", "/opt/hermes/.venv/bin/hermes")
 MAILHUB_BASE = os.getenv("MAILHUB_BASE_URL", "").rstrip("/")
@@ -371,6 +372,16 @@ def queue_and_send(con, lead) -> Optional[str]:
     # while it is standing down. Re-routing to a healthy sender instead would
     # move the conversation to an address the recipient has never heard from,
     # and the approval MailHub holds is filed under the original owner anyway.
+    # The global brake, checked before anything sender-specific. Holding here
+    # leaves the lead in READY_TO_SEND exactly as the per-sender pause does, so
+    # starting again resumes at normal pacing instead of releasing a backlog.
+    # It deliberately does not recall mail already handed to MailHub: MailHub
+    # owns its queue, which is the same boundary a mailbox pause has.
+    brake = OB.state()
+    if brake["stopped"]:
+        return ("READY_TO_SEND: holding, outreach stopped (%s)"
+                % (brake["reason"] or "no reason recorded")[:80])
+
     stood_down = tenants.is_paused(con, draft["tenant_user_id"])
     if stood_down:
         return ("READY_TO_SEND: holding, sender %s paused until %s (%s)"

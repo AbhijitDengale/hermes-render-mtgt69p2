@@ -39,7 +39,9 @@ import json
 import pathlib
 import re
 import sqlite3
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
+
+import outreach_brake as OB
 
 __all__ = ["snapshot", "render", "fingerprint", "parse_command", "apply_command",
            "state_path", "load_state", "save_state", "PAUSE_FOREVER"]
@@ -53,6 +55,12 @@ STATE_FILE = "mailbox_console.json"
 _CMD_RE = re.compile(
     r"^\s*(?P<verb>pause|resume|enable|disable|status)\b\s*"
     r"(?P<target>t?\d+)?\s*(?P<rest>.*)$", re.IGNORECASE)
+
+# The global brake is a separate verb pair so it can never be confused with a
+# per-mailbox one: `stop outreach` halts everything, `pause t9` halts one
+# sender. A bare `stop t9` is deliberately not accepted — it reads both ways.
+_BRAKE_RE = re.compile(
+    r"^\s*(?P<verb>stop|start)\s+outreach\b\s*(?P<rest>.*)$", re.IGNORECASE)
 
 HEALTHY, RISKY, BAD = "🟢", "🟡", "🔴"
 
@@ -127,6 +135,15 @@ def snapshot(con: sqlite3.Connection) -> List[Dict[str, Any]]:
     return rows
 
 
+def _headline() -> str:
+    """The first thing the operator reads: is anything going out at all."""
+    b = OB.state()
+    if not b["stopped"]:
+        return "🟢 **Outreach running.** Live sender health; card updates in place."
+    return ("⛔ **OUTREACH STOPPED** — %s\nNo new mail is being queued."
+            % (b["reason"] or "no reason recorded"))
+
+
 def _dot(row: Dict[str, Any]) -> str:
     if row["paused"]:
         return BAD
@@ -138,9 +155,11 @@ def _dot(row: Dict[str, Any]) -> str:
 def fingerprint(rows: List[Dict[str, Any]]) -> str:
     """What the card would say. Changes only when the card should be redrawn."""
     import hashlib
-    parts = ["%s|%s|%s|%s|%s|%s" % (r["user_id"], r["paused"], r["sent"],
-                                    r["bounced"], r["bounce_rate"], r["health"])
-             for r in rows]
+    b = OB.state()
+    parts = ["brake|%s|%s" % (b["stopped"], b["reason"])]
+    parts += ["%s|%s|%s|%s|%s|%s" % (r["user_id"], r["paused"], r["sent"],
+                                     r["bounced"], r["bounce_rate"], r["health"])
+              for r in rows]
     return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:16]
 
 
@@ -178,14 +197,16 @@ def render(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
                  % (total_sent, total_bounced, overall)})
     fields.append({
         "name": "Controls", "inline": False,
-        "value": "`pause t9 reason here` — disable a mailbox\n"
+        "value": "`pause t9 reason here` — disable one mailbox\n"
                  "`resume t9` — re-enable it\n"
+                 "`stop outreach <reason>` — halt ALL new queueing\n"
+                 "`start outreach` — resume queueing\n"
                  "`status` — refresh this card"})
 
     return {
         "title": "Mailbox Console",
-        "color": 0xED4245 if off else 0x57F287,
-        "description": "Live sender health. This card updates in place.",
+        "color": 0xED4245 if (off or OB.stopped()) else 0x57F287,
+        "description": _headline(),
         "fields": fields,
         "footer": {"text": "Hermes · sales mailboxes"},
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -203,6 +224,10 @@ def parse_command(text: str) -> Optional[Dict[str, Any]]:
     """
     if not text:
         return None
+    brake = _BRAKE_RE.match(text.strip())
+    if brake:
+        return {"verb": "%s_outreach" % brake.group("verb").lower(),
+                "reason": (brake.group("rest") or "").strip()}
     m = _CMD_RE.match(text.strip())
     if not m:
         return None
@@ -232,6 +257,28 @@ def apply_command(con: sqlite3.Connection, cmd: Dict[str, Any],
     verb = cmd["verb"]
     if verb == "status":
         return ""
+
+    # The global brake. Separate from the per-mailbox switches on purpose:
+    # stopping outreach leaves every sender pause and lead hold exactly as it
+    # was, and starting it again lifts only this one.
+    if verb == "stop_outreach":
+        r = OB.stop(cmd.get("reason") or "", by=actor)
+        if not r.get("changed"):
+            return "Outreach is already stopped."
+        _audit(con, 0, "outreach.stop", r.get("reason", ""), actor)
+        con.commit()
+        return ("⛔ **Outreach STOPPED** — %s\n"
+                "Leads keep their place. Mail already handed to MailHub is not recalled."
+                % (r.get("reason") or "no reason given"))
+    if verb == "start_outreach":
+        r = OB.start(by=actor)
+        if not r.get("changed"):
+            return "Outreach is already running."
+        _audit(con, 0, "outreach.start", "", actor)
+        con.commit()
+        return ("✅ **Outreach STARTED** — queueing resumes at normal pacing.\n"
+                "Sender pauses and lead holds are unchanged.")
+
     uid = cmd["user_id"]
     row = con.execute("SELECT tenant_name, user_id, mailbox_email, paused_until"
                       " FROM tenant_health WHERE user_id=?", (uid,)).fetchone()

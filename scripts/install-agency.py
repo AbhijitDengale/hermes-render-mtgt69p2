@@ -73,7 +73,7 @@ CRON_JOBS = {
                          "local"),
     # The operator's pause/resume console for the sending mailboxes. Posts a
     # card only when the fleet changes, and consumes typed commands once.
-    "mailbox-console": (HERMES_HOME, "every 2m", "mailbox_console.py", "local"),
+    "mailbox-console": (HERMES_HOME, "every 2m", "mailbox_console.py", "outreach_brake.py", "local"),
 }
 # The alerts job runs from the root profile deliberately: Discord is
 # configured there and nowhere else, so a job scheduled on a sub-profile
